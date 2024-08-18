@@ -12,45 +12,20 @@ from transformers import BertConfig
 from transformers.models.bert.modeling_bert import BertEncoder, BertPredictionHeadTransform
 
 
-# class MLP(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, output_dim, num_blocks=5, bottleneck_dim=64):
-#         super(MLP, self).__init__()
-#         self.input_layer = nn.Linear(input_dim, hidden_dim)
+from torch.utils.data import DataLoader, Dataset
 
-#         self.attention_layers = nn.ModuleList()
-#         self.layers = nn.ModuleList()
-#         for _ in range(num_blocks):
-#             shortcut_layers = []
-#             shortcut_layers.append(nn.LayerNorm(hidden_dim))
-#             shortcut_layers.append(nn.PReLU())
-#             shortcut_layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
-#             shortcut_layers.append(nn.LayerNorm(hidden_dim))
-#             self.attention_layers.append(nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True, bias=True))
-#             self.layers.append(nn.Sequential(*shortcut_layers))
-
-#         self.output_layer= nn.Linear(hidden_dim, output_dim, bias=False)
-#         # self.output_w = nn.Parameter(torch.randn(hidden_dim, output_dim))
-        
-#     def forward(self, x):
-#         x = self.input_layer(x)
-#         for idx, layer in enumerate(self.layers):
-#             x = x + layer(self.attention_layers[idx](x, x, x)[0]) # shortcut
-#         # x = F.normalize(x, p=2, dim=-1)
-#         # w = F.normalize(self.output_w, p=2, dim=0)
-#         # x = x @ w
-#         return self.output_layer(x)
 
 class Encoder(BertEncoder):
-    def __init__(self, hidden_size=768):
+    def __init__(self, hidden_size=768, pred_hidden_dim=768):
         config = BertConfig()
         config.num_hidden_layers = 6
-        config.hidden_size = 768
+        config.hidden_size = hidden_size
         config.intermediate_size = 3072
         config.num_attention_heads = 12
         super().__init__(config)
-        self.pre_fc = nn.Linear(hidden_size, 768)
+        self.pre_fc = nn.Linear(hidden_size, pred_hidden_dim)
         self.transform = BertPredictionHeadTransform(config)
-        self.fc = nn.Linear(768, 1)
+        self.fc = nn.Linear(pred_hidden_dim, 1)
     
     def forward(self, hidden_states):
         hidden_states = self.pre_fc(hidden_states)
@@ -94,7 +69,7 @@ def similarity_measure(logits, labels, attention_mask):
 
 
 class MaskGeneratingModel(nn.Module):
-    def __init__(self, hidden_size=4096, mlp_hidden_dim=1024, mlp_bottleneck_dim=768, mlp_num_blocks=2):
+    def __init__(self, hidden_size=4096, mlp_hidden_dim=1024, lr=1e-4, epsilon=0.2):
         """ 
         hidden_size: int
             The hidden size of the output of the generative model, 4096 for llama3
@@ -103,30 +78,41 @@ class MaskGeneratingModel(nn.Module):
 
         self.hidden_size = hidden_size
 
-        # self.explain_map = MLP(input_dim=hidden_size, 
-        #                        hidden_dim=mlp_hidden_dim, 
-        #                        output_dim=1, 
-        #                        num_blocks=mlp_num_blocks, 
-        #                        bottleneck_dim=mlp_bottleneck_dim) # takes [N, L, hidden_size] outputs [N, L, 1]
-        self.explain_map = Encoder(hidden_size=hidden_size)
-        self.logit_scale = nn.Parameter(torch.tensor(1.0))
-
-        def bce_loss(input, target, context_mask):
-            loss = F.binary_cross_entropy(input, target, reduction='none')
-            loss = (loss * context_mask).sum(-1) / context_mask.sum(dim=-1)
-
-            return loss
-
-        self.bce_loss = bce_loss
+        self.policy_net = Encoder(hidden_size=hidden_size, pred_hidden_dim=mlp_hidden_dim)
+        self.value_net = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_dim, 1)
+        )
+        self.lr = lr
+        self.epsilon = epsilon
     
     def forward(self, pred_features):
-        """ 
-        pred_features: torch.Tensor of shape [N, L, hidden_size]
-        """
-        mask_logits = self.explain_map(pred_features).squeeze(-1) # [N, L]
-        mask_logits = mask_logits * self.logit_scale.exp()
+        mask_logits, value = self.policy_net(pred_features), self.value_net(pred_features).squeeze(-1)
+        return mask_logits, value
 
-        return mask_logits # [batch_size, seq_len]
+    def training_step(self, batch, batch_idx):
+        # Unpack batch
+        states, actions, old_log_probs, rewards = batch
+        returns = []
+        R = 0
+        for r in reversed(rewards):
+            R = r + self.gamma * R
+            returns.insert(0, R)
+        returns = torch.tensor(returns).to(self.device)
+        
+        logits = self(states)
+        dist = Categorical(logits=logits)
+        new_log_probs = dist.log_prob(actions)
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        advantages = returns - returns.mean()
+
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+        loss = -torch.min(surr1, surr2).mean()
+
+        self.log("train_loss", loss)
+        return loss
     
     @torch.no_grad()
     def generate_mask(self, mask_logits, context_mask):
@@ -141,33 +127,46 @@ class MaskGeneratingModel(nn.Module):
             mask: torch.Tensor, shape (batch_size, seq_len), with contexts being all 1s and user inputs being randomly masked.
         """
         mask_probs = torch.sigmoid(mask_logits) # (batch_size, seq_len)
-        # mask_probs = torch.clamp(mask_probs, 0, 0.85)
-        mask = torch.bernoulli(mask_probs) # (batch_size, seq_len)
 
-        # mask_probs = mask_probs * context_mask
-        # k_ratio = 0.5
-        # # k_values = (k_ratio * context_mask.sum(-1)).int()
-        # k_values = 20 * torch.ones_like(context_mask.sum(-1)).int()
-        # # print(k_values)
-        # mask = torch.zeros_like(mask_logits)
-        # for i in range(mask_logits.size(0)):
-        #     top_k_values, top_k_indices = torch.topk(mask_probs[i], k=max(1, k_values[i]), dim=-1)
-        #     mask[i, top_k_indices] = 1
-        # # generate a mask of shape mask_probs with probability 0.6
-        # bernoulli_mask = torch.bernoulli(torch.ones_like(mask_probs) * 0.5)
-        # # Top k% of candidate mask then randomly sample 60% of the candidates as the mask
-        # mask = mask * bernoulli_mask 
-        # mask_ratio = mask.sum(-1) / context_mask.sum(-1)
+        # For each batch, sample a proportion k from uniform [0, 1)
+        batch_size, seq_len = mask_logits.size()
+        k_values = torch.rand(batch_size).to(mask_logits.device)  # shape (batch_size,)
 
-        # mask = 1 - mask
+        # Initialize masks with all ones (unmasked tokens)
+        masks = torch.zeros_like(mask_logits)
 
-        mask = (context_mask * mask + (1. - context_mask)) # do not mask the context tokens for prompting
-        # print(context_mask[0])
-        # print(mask[0])
+        for i in range(batch_size):
+            # Get the indices of context tokens
+            context_indices = torch.nonzero(context_mask[i], as_tuple=False).squeeze() 
+            # Get the number of tokens in the context 
+            num_context_tokens = context_indices.size(0)
 
+            # Calculate the number of tokens to unmask based on k
+            k = k_values[i].item()  # scalar k for this batch
 
+            num_unmasked = max(1, int(k * num_context_tokens))  # Ensure at least one token is unmasked
 
-        return mask # only randomly mask the context locations, otherwise 1.
+            # Get logits for context tokens and sort them by value
+            context_logits = mask_logits[i, context_indices]
+            sorted_indices = torch.argsort(context_logits, descending=True)  # Sort in descending order
+
+            # Select top-k tokens to unmask
+            top_k_indices = sorted_indices[:num_unmasked]
+
+            # Set the corresponding mask values to 1 (unmask)
+            unmasked_indices = context_indices[top_k_indices]
+            masks[i, unmasked_indices] = 1  # Unmask the selected tokens
+
+        # Combine with the context mask to ensure only context tokens are affected
+        final_mask = (context_mask * masks) + (1. - context_mask)  # Ensure non-context tokens remain unmasked
+
+        return final_mask # only randomly mask the context locations, otherwise 1.
+
+    def ppo_loss(self, new_log_probs, old_log_probs, advantage):
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon)
+        loss = -torch.min(ratio * advantage, clipped_ratio * advantage).mean()
+        return loss
     
     @torch.no_grad()
     def sample_one_batch(self, input_ids, attention_mask, mask_logits, context_mask):
@@ -186,9 +185,9 @@ class MaskGeneratingModel(nn.Module):
         # print(masked_attention_mask[0])
 
         # get the padded input_ids
-        # masked_input_ids = self.tokenizer.pad_token_id * torch.ones_like(input_ids) * (1 - masked_attention_mask).long() + input_ids * masked_attention_mask.long()
+        masked_input_ids = self.tokenizer.pad_token_id * torch.ones_like(input_ids) * (1 - masked_attention_mask).long() + input_ids * masked_attention_mask.long()
 
-        return input_ids, masked_attention_mask, mask
+        return masked_input_ids, masked_attention_mask, mask
     
     def sample_one_batch_multi_samples(self, input_ids, attention_mask, mask_logits, context_mask, num_samples=5):
         """ 
@@ -217,8 +216,11 @@ class MaskGeneratingModel(nn.Module):
         return sim, correct_logprob
     
     @torch.no_grad()
-    def get_reward(self, sim, sim_gt):
+    def get_reward(self, sim, sim_gt, user_input_mask, context_mask):
         reward = torch.exp(sim - sim_gt)
+        # factor = context_mask.sum(-1) / user_input_mask.sum(-1)
+        factor = user_input_mask.sum(-1) / context_mask.sum(-1)
+        reward = reward * torch.log(factor + 1e-5)
         # reward = torch.exp(sim_gt - sim)
         # reward = torch.exp(sim_gt - sim) 
         # reward = torch.exp(sim)
@@ -253,18 +255,18 @@ class MaskGeneratingModel(nn.Module):
         for perturbed_input_ids, perturbed_attention_mask, user_input_mask in perturbed_samples:
             # obtain the similarity of the perturbed samples
             sim, _ = self.calculate_sim(model, perturbed_input_ids, perturbed_attention_mask, response_mask, labels=gen_tokens)
-            reward = self.get_reward(sim, sim_gt) 
-            advantage = reward - 0.9
+            reward = self.get_reward(sim, sim_gt, user_input_mask, context_mask) 
+            advantage = reward - 0.2
             total_advantage += advantage
             # reward = torch.exp(sim)
             total_reward += reward
             # reward_loss += (torch.relu(reward - 0.5) * self.bce_loss(mask_prob, user_input_mask, context_mask)).mean(dim=-1)
             user_input_mask = user_input_mask * context_mask 
-            # reward_loss += (reward * self.bce_loss(mask_prob, user_input_mask, context_mask)).mean()
-            reward_loss += (advantage * self.bce_loss(mask_prob, user_input_mask, context_mask)).mean()
+            reward_loss += (reward * self.bce_loss(mask_prob, user_input_mask, context_mask)).mean()
+            # reward_loss += (advantage * self.bce_loss(mask_prob, user_input_mask, context_mask)).mean()
 
             # the effective mask is the mask sum of entries that are not masked 
-            effective_mask_prob = (mask_prob * user_input_mask * context_mask).sum(-1) / context_mask.sum(dim=-1)
+            effective_mask_prob = (mask_prob_1 * user_input_mask * context_mask).sum(-1) / context_mask.sum(dim=-1)
             total_effective_mask_prob += effective_mask_prob
 
             
@@ -274,7 +276,7 @@ class MaskGeneratingModel(nn.Module):
         effective_mask_prob = total_effective_mask_prob / num_samples
         # mask_loss = (mask_prob * context_mask).sum(-1) / context_mask.sum(dim=-1)
 
-        mask_mean = (mask_prob.sum(-1) / context_mask.sum(-1)).mean()
+        mask_mean = (mask_prob_1.sum(-1) / context_mask.sum(-1)).mean()
         mean_reward = total_reward / num_samples
 
         # mask_loss = ((1.2 - mean_reward - mask_loss)**2).mean()
@@ -285,10 +287,11 @@ class MaskGeneratingModel(nn.Module):
         # advantage = mean_reward - 0.2
         advantage = total_advantage / num_samples
         mask_loss = (mask_prob_1.sum(-1) / context_mask.sum(-1) * advantage).mean()
+        # mask_loss = mask_mean
         # mask_loss = ((0.2 -  effective_mask_prob)**2).mean()
         # mean_reward = mean_reward.mean()
 
-        loss = reward_loss + 1 * mask_loss
+        loss = reward_loss #+ 0.01 * mask_loss
         return {'loss': loss, 'reward_loss': reward_loss, 'mask_loss': mask_loss, 'mask_mean': mask_mean, 'mean_reward': mean_reward, 'advantage': advantage.mean()}
     
     def compute_similarity(self, logits, labels, attention_mask):
