@@ -13,33 +13,41 @@ from transformers.models.bert.modeling_bert import BertEncoder, BertPredictionHe
 from torch.distributions import Bernoulli
 import numpy as np
 
-# class MLP(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, output_dim, num_blocks=5, bottleneck_dim=64):
-#         super(MLP, self).__init__()
-#         self.input_layer = nn.Linear(input_dim, hidden_dim)
+def create_segmented_mask(tokens, probs, punctuation_tokens=[11, 13, 30, 0]):
+    """
+    根据停顿标点将tokens进行分块，计算每段内的平均概率，然后根据平均概率生成一个mask。
+    
+    tokens: Tensor of shape [N, L] 表示文本tokens
+    probs: Tensor of shape [N, L] 表示Bernoulli分布的概率
+    punctuation_tokens: Set of punctuation tokens (e.g., {",", ".", "?"})
 
-#         self.attention_layers = nn.ModuleList()
-#         self.layers = nn.ModuleList()
-#         for _ in range(num_blocks):
-#             shortcut_layers = []
-#             shortcut_layers.append(nn.LayerNorm(hidden_dim))
-#             shortcut_layers.append(nn.PReLU())
-#             shortcut_layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
-#             shortcut_layers.append(nn.LayerNorm(hidden_dim))
-#             self.attention_layers.append(nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True, bias=True))
-#             self.layers.append(nn.Sequential(*shortcut_layers))
-
-#         self.output_layer= nn.Linear(hidden_dim, output_dim, bias=False)
-#         # self.output_w = nn.Parameter(torch.randn(hidden_dim, output_dim))
-        
-#     def forward(self, x):
-#         x = self.input_layer(x)
-#         for idx, layer in enumerate(self.layers):
-#             x = x + layer(self.attention_layers[idx](x, x, x)[0]) # shortcut
-#         # x = F.normalize(x, p=2, dim=-1)
-#         # w = F.normalize(self.output_w, p=2, dim=0)
-#         # x = x @ w
-#         return self.output_layer(x)
+    Returns:
+    mask: Tensor of shape [N, L] 表示最终的mask
+    """
+    N, L = tokens.shape
+    mask = torch.zeros_like(tokens, dtype=torch.bool)  # 初始化mask，和tokens形状相同
+    
+    for i in range(N):
+        start_idx = 0
+        segment_probs = []
+        for j in range(L):
+            if tokens[i, j].item() in punctuation_tokens or j == L - 1:  # 检查是否到达标点或行末
+                end_idx = j + 1  # 包含标点
+                
+                # 获取当前区块的概率
+                segment_prob = probs[i, start_idx:end_idx].mean()
+                segment_probs.append(segment_prob)
+                
+                # 对区块的概率进行采样
+                segment_sample = torch.bernoulli(segment_prob)
+                
+                # 设置mask
+                mask[i, start_idx:end_idx] = segment_sample
+                
+                # 更新起始索引
+                start_idx = end_idx
+                
+    return mask
 
 class Encoder(BertEncoder):
     def __init__(self, hidden_size=768):
