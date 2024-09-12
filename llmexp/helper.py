@@ -78,7 +78,7 @@ class LlmExpHelper:
             context_lens = [len(tokenizer.encode(context)) for context in context]
             context_lens_tensor = torch.tensor(context_lens, dtype=torch.long)
             mask_tensor_v2 = apply_mask(torch.ones_like(batch['input_ids']), context_lens_tensor)
-            batch['context_mask'] = mask_tensor_v2
+            batch['context_mask'] = mask_tensor_v2 * batch['attention_mask']
             
         
         return batch

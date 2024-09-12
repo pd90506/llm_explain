@@ -15,77 +15,6 @@ import numpy as np
 import torch.utils.checkpoint as checkpoint
 
 
-def pairwise_token_attention(h, context_mask, response_mask, logit_scale):
-    """
-    h: torch.Tensor, shape (batch_size, seq_len, hidden_size)
-    context_mask: torch.Tensor, shape (batch_size, seq_len)
-    response_mask: torch.Tensor, shape (batch_size, seq_len)
-    """
-    N, L, d = h.shape
-
-    # calculate pairwise attention scores，(N, N, L, L)
-    h = F.normalize(h, p=2, dim=-1) # (N, L, d)
-    h1 = h * context_mask.unsqueeze(-1)
-    h2 = h * response_mask.unsqueeze(-1)
-    scores = torch.einsum('ikd,jld->ijkl', h1, h2) # (N, N, L, L)
-    # scores = scores / torch.sqrt(torch.tensor(d, dtype=torch.float32)) # (N, N, L, L)
-    scores = scores.sum(-1, keepdim=True) / response_mask.unsqueeze(0).unsqueeze(2).sum(-1,keepdim=True) # (N, N, L, 1)
-    # scores = scores.sum(-2, keepdim=True) / context_mask.unsqueeze(1).unsqueeze(3).sum(-2, keepdim=True) # (N, N, 1, 1)
-    # scores = scores.squeeze(-1).squeeze(-1) # (N, N)
-    scores = scores.squeeze(-1) # (N, N, L) (ijk)
-    scores = torch.clamp((scores + 1) / 2, 0, 1)  # range (0, 1)
-
-    # print_scores = scores.sum(-1) / context_mask.sum(-1).unsqueeze(1)
-    # print_scores = print_scores * logit_scale.exp()
-    # print("scores", print_scores[:2, :2])
-    return scores # (N, N, L) (ijk)
-
-    # # Expanding context_mask to match the dimensions of scores: (N, 1, L, 1)
-    # context_mask_expanded = context_mask.unsqueeze(1).unsqueeze(-1).expand(N, N, L, L)
-    # # Expanding response_mask to match the dimensions of scores: (1, N, 1, L)
-    # response_mask_expanded = response_mask.unsqueeze(0).unsqueeze(2).expand(N, N, L, L)
-
-    # # Applying masks: set scores to -inf where the masks are 0
-    # scores_context_masked = scores.masked_fill(context_mask_expanded == 0, float('-inf'))
-    # scores_response_masked = scores.masked_fill(response_mask_expanded == 0, float('-inf'))
-
-    # weights_context = F.softmax(scores_response_masked, dim=-1) # (N, N, L, L)
-    # weights_response = F.softmax(scores_context_masked, dim=-2) # (N, N, L, L)
-
-    # # calculate the output of the pairwise attention
-    # output_context = torch.matmul(weights_context, h2.unsqueeze(0)) # (N, N, L, d) (ijkl, ijld->ijkd)
-    # output_response = torch.matmul(weights_response.permute(0,1,3,2), h1.unsqueeze(1)) # (N, N, L, d) (ijlk, ijkd->ijld)
-
-    # output = F.normalize(output, p=2, dim=-1) # (N, N, L, d)
-    # print("output", output[0, 0, :, 0])
-
-    # return output
-
-def calc_contrast_loss(h, context_mask, temperature):
-    """ 
-    h: torch.Tensor, shape (N, N, L)
-    context_mask: torch.Tensor, shape (N, L)
-    """
-    margin = 0.1
-    N, _, L = h.shape
-    h = h * context_mask.unsqueeze(1) # (N, N, L)
-    mean_scores = h.sum(-1) / context_mask.sum(-1).unsqueeze(1) # (N, N)
-
-    # calculate contrast loss
-    # similarity_matrix = mean_scores * temperature
-    similarity_matrix = mean_scores
-    # print("similarity_matrix.shape", similarity_matrix.shape)
-    print("similarity_matrix", similarity_matrix[:2, :2])
-
-    labels = torch.eye(N, dtype=torch.float32, device=similarity_matrix.device)
-    # positive_loss = labels * torch.pow(1 - similarity_matrix, 2)
-    # negative_loss = (1 - labels) * torch.pow(torch.clamp(similarity_matrix - margin, min=0.0), 2)
-
-    # contrast_loss = torch.mean(positive_loss + negative_loss)
-    contrast_loss = torch.mean(torch.pow(similarity_matrix - labels, 2))
-    return contrast_loss
-
-
 def similarity_measure(logits, labels, attention_mask):
     """ 
     args:
@@ -117,8 +46,6 @@ def get_causal_mask(inputs, attention_mask=None):
     causal_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=0).to(inputs.device).unsqueeze(0) # [1, seq_len, seq_len]
     causal_mask = causal_mask.repeat(inputs.size(0), 1, 1) # [batch_size, seq_len, seq_len]
     if attention_mask is not None:
-        # print("attention_mask", attention_mask.shape)
-        # print("causal_mask", causal_mask.shape)
         # Ensure causal_mask matches the batch size and seq_len dimensions of attention_mask
         causal_mask = causal_mask * attention_mask.unsqueeze(1)  # [batch_size, seq_len, seq_len]
         causal_mask = causal_mask * attention_mask.unsqueeze(2)  # [batch_size, seq_len, seq_len]
@@ -127,7 +54,7 @@ def get_causal_mask(inputs, attention_mask=None):
 
 
 class MaskGeneratingModel(nn.Module):
-    def __init__(self, hidden_size=64):
+    def __init__(self, hidden_size=4096, emb_weights=None):
         """ 
         hidden_size: int
             The hidden size of the output of the generative model, 4096 for llama3
@@ -135,64 +62,116 @@ class MaskGeneratingModel(nn.Module):
         super().__init__()
 
         self.hidden_size = hidden_size
-        # if emb_weights is None:
-        #     raise ValueError("The embedding weights must be provided to match the weights of the prediction head.")
+        if emb_weights is None:
+            raise ValueError("The embedding weights must be provided to match the weights of the prediction head.")
         
-        # self.lm_head = nn.Linear(hidden_size, emb_weights.size(0), bias=False)
-        # self.lm_head.weight = torch.nn.Parameter(emb_weights)
-        # # freeze lm_head.weight 
-        # self.lm_head.weight.requires_grad = False
-        self.reduce_map = nn.Sequential(nn.Linear(4096, 2048),
-                                        nn.ReLU(),
-                                        nn.Linear(2048, 1024),
-                                        nn.ReLU(),
-                                        nn.Linear(1024, hidden_size))
-        # self.reduce_map = nn.Linear(4096, hidden_size)
+        self.lm_head = nn.Linear(hidden_size, emb_weights.size(0), bias=False)
+        self.lm_head.weight = torch.nn.Parameter(emb_weights)
+        # freeze lm_head.weight 
+        self.lm_head.weight.requires_grad = False
        
-        self.policy_states_map = nn.Sequential(nn.Linear(hidden_size, hidden_size),
+        self.policy_map = nn.Sequential(nn.Linear(hidden_size, hidden_size),
                                         nn.ReLU(),
                                         nn.Linear(hidden_size, hidden_size))
-        self.layer_norm_policy = nn.LayerNorm(hidden_size)
 
-        self.policy_map = nn.Linear(hidden_size, 1)
-        self.value_map = nn.Linear(hidden_size, 1)
+        self.value_map = nn.Sequential(nn.Linear(hidden_size, hidden_size),
+                                        nn.ReLU(),
+                                        nn.Linear(hidden_size, hidden_size),
+                                        nn.Linear(hidden_size, 1))
         
-        self.logit_scale = nn.Parameter(torch.tensor(1.0))
-
-        self.value_layer_norm = nn.LayerNorm(hidden_size)
-
+        # self.logit_scale = nn.Parameter(torch.tensor(1.0))
     
-    def forward(self, hidden_states: torch.Tensor, context_mask: torch.Tensor, response_mask: torch.Tensor):
+    def token_wise_prediction_head(self, hidden_states, causal_mask=None, labels=None, chunk_size=1):
         """ 
         hidden_states: torch.Tensor of shape [N, L, hidden_size]
-        context_mask: torch.Tensor of shape [N, L]
+        causal_mask: torch.Tensor of shape [N, L, L]
+        """
+        if causal_mask is None:
+            causal_mask = get_causal_mask(hidden_states) # [N, L, L]
+        if labels is None:
+            raise ValueError("The labels must be provided for the token-wise prediction head.")
+
+        hidden_states = hidden_states.float() # [N, L, hidden_size]
+        hidden_states = self.policy_map(hidden_states) # [N, L, hidden_size]
+
+        N, L, hidden_size = hidden_states.size()
+        lm_prob_list = []
+
+        # shift labels and response_mask to the left by one to match the next token prediction format
+        labels = labels.clone()
+        labels[:, :-1] = labels[:, 1:]
+        labels[:, -1] = -100 # a random value that will be masked by the shift_response_mask
+        label_mask = labels == -100 # [N, L]
+
+        safe_labels = torch.clamp(labels, min=0)
+
+        # process the hidden states in chunks along thesecond dimension (tokens)
+        for i in range(0, L, chunk_size):
+            actual_chunk_size = min(chunk_size, L - i * chunk_size)
+            chunk_hidden_states_1 = hidden_states[:, i:i+actual_chunk_size].unsqueeze(2) # [N, actual_chunk_size, 1, hidden_size]
+            chunk_hidden_states_2 = hidden_states.unsqueeze(1) # [N, 1, L, hidden_size]
+
+            chunk_hidden_states = chunk_hidden_states_1 * chunk_hidden_states_2 # [N, actual_chunk_size, L, hidden_size]
+            # chunk_causal_mask = causal_mask[:, i:i+actual_chunk_size] # [N, actual_chunk_size, L]
+
+            # Wrap the lm_head call in a checkpoint
+            chunk_lm_logits = checkpoint.checkpoint(self.lm_head, chunk_hidden_states) # [N, actual_chunk_size, L, vocab_size]
+            # chunk_lm_logits = chunk_lm_logits * chunk_causal_mask.unsqueeze(-1) # [N, actual_chunk_size, L, vocab_size]
+            chunk_lm_probs = torch.softmax(chunk_lm_logits, dim=-1) # [N, actual_chunk_size, L, vocab_size]
+            # print("chunk_lm_probs", chunk_lm_probs)
+            chunk_lm_probs = chunk_lm_probs.gather(dim=-1, index=safe_labels.unsqueeze(1).unsqueeze(-1).expand(N, actual_chunk_size, L, 1)).squeeze(-1) # [N, chunk_size, L]
+
+            chunk_label_mask = label_mask.unsqueeze(1).expand(N, actual_chunk_size, L) # [N, chunk_size, L]
+            chunk_lm_probs = chunk_lm_probs.masked_fill(chunk_label_mask, 0) # [N, L, L]
+
+            lm_prob_list.append(chunk_lm_probs)
+            print("step", i, chunk_lm_probs.shape)
+        
+        # Concatenate the lm_logits along the second dimension
+        print("chunk_lm_probs", chunk_lm_probs.shape)
+        lm_probs = torch.cat(lm_prob_list, dim=1) # [N, L, L]
+        lm_probs = (lm_probs * causal_mask).sum(-1) / (causal_mask.sum(-1) + 1) # [N, L], +1 for numerical stability
+        print("lm_probs", lm_probs.shape)
+
+
+
+        # # pair-wise element-wise product of the hidden states between each token pair
+        # hidden_states = hidden_states.unsqueeze(2) * hidden_states.unsqueeze(1) # [N, L, L, hidden_size]
+        # # Wrap the lm_head call in a checkpoint
+        # # hidden_states = checkpoint.checkpoint(self.lm_head, hidden_states)
+        # lm_logits = self.lm_head(hidden_states) # [N, L, L, vocab_size]
+        # lm_logits = lm_logits * causal_mask.unsqueeze(-1) # [N, L, L, vocab_size]
+
+        return lm_probs
+
+    
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, response_mask: torch.Tensor, labels: torch.Tensor):
+        """ 
+        hidden_states: torch.Tensor of shape [N, L, hidden_size]
+        attention_mask: torch.Tensor of shape [N, L]
         response_mask: torch.Tensor of shape [N, L]
         labels: torch.Tensor of shape [N, L]
         """
-        # convert to low dimensional space
-        hidden_states = self.reduce_map(hidden_states) # [N, L, hidden_size]
-        # hidden_states = self.layer_norm_after_reduce(hidden_states)
+        # Combine the attention_mask with causal_mask
+        causal_mask = get_causal_mask(hidden_states, attention_mask) # [N, L, L]
 
-        policy_hidden_states = self.policy_states_map(hidden_states) # [N, L, hidden_size]
-        policy_states = pairwise_token_attention(policy_hidden_states, context_mask, response_mask, self.logit_scale) # [N, N, L]
-        # policy_states = pairwise_token_attention(policy_hidden_states, context_mask, response_mask) # [N, N, L, hidden_size]
-        # policy_states = self.layer_norm_policy(policy_states) # [N, N, L, hidden_size]
+        # policy_logits = self.token_wise_prediction_head(hidden_states, causal_mask, labels=labels) #[N, L, L, vocab_size]
+        # policy_probs = torch.softmax(policy_logits, dim=-1) # [N, L, L, vocab_size]
+        policy_probs = self.token_wise_prediction_head(hidden_states, causal_mask, labels=labels) # [N, L]
 
-        # policy_logits = self.policy_map(policy_states).squeeze(-1) # [N, N, L]
+
+        # label_mask = labels == -100 # [N, L]
+        # policy_probs = policy_probs.masked_fill(label_mask.unsqueeze(-1), 0) # [N, L, L]
+        # policy_probs = (policy_probs * causal_mask).sum(-1) / (causal_mask.sum(-1) + 1) # [N, L], +1 for numerical stability
+
+        
+        dist = Bernoulli(probs=policy_probs) # [N, L]
 
         # Calculate the value function
-        # print("policy_states", policy_states.shape)
-        # value_hidden_states = torch.diagonal(policy_states, offset=0, dim1=0, dim2=1).permute(2, 0, 1) # [N, L, hidden_size]
-        # print("value_hidden_states", value_hidden_states.shape)
-        # value_hidden_states = self.value_layer_norm(value_hidden_states)
-        combined_mask = torch.clamp(context_mask + response_mask, 0, 1) # [N, L]
-        value_hidden_states = policy_hidden_states * combined_mask.unsqueeze(-1) # [N, L, hidden_size]
+        value = self.value_map(hidden_states).squeeze(-1) # [N, L]
+        value = (value * response_mask).sum(-1) / (response_mask.sum(-1) + 1) # [N]
 
-        value = self.value_map(value_hidden_states).squeeze(-1) # [N, L]
-        value = (value * context_mask).sum(-1) / (context_mask.sum(-1) + 1e-5) # [N]
-
-
-        return policy_states, value # [N, N, L], [N,]
+        return dist, value
 
     def get_dist_critic(self, model, state):
         """ 
@@ -204,35 +183,9 @@ class MaskGeneratingModel(nn.Module):
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
             last_hidden_state = outputs.hidden_states[-1].float() # [N, L, hidden_size]
-        
-        policy_logits, value = self.forward(last_hidden_state, context_mask, response_mask=response_mask)
-        # print("policy_logits_origin", policy_logits[0][:5][:10])
-        policy_logits = torch.diagonal(policy_logits, offset=0, dim1=0, dim2=1).permute(1,0) # [N, L]
-        # print("policy_logits", policy_logits[0][:100])
-        # policy_logits = policy_logits * self.logit_scale.exp()
-
-        dist = Bernoulli(probs=policy_logits) # [N, L]
-
+        dist, value = self.forward(last_hidden_state, attention_mask, response_mask=response_mask, labels=input_ids)
         return dist, value
 
-    def get_dist_critic_for_ppo(self, model, state):
-        """ 
-        model: The Llama3 model to generate the logits
-        state: The input state, consisting of input_ids, attention_mask, context_mask, response_mask
-        """
-        input_ids, attention_mask, context_mask, response_mask = state
-        # Extract features from the model
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
-            last_hidden_state = outputs.hidden_states[-1].float() # [N, L, hidden_size]
-        
-        policy_logits, value = self.forward(last_hidden_state, context_mask, response_mask=response_mask)
-        diagonal_logits = torch.diagonal(policy_logits, offset=0, dim1=0, dim2=1).permute(1,0) # [N, L]
-        # diagonal_logits = diagonal_logits * self.logit_scale.exp()
-
-        dist = Bernoulli(probs=diagonal_logits) # [N, L]
-
-        return dist, value, policy_logits
     
     def ppo_iter(self, mini_batch_size, states, actions, log_probs, returns, advantage, labels):
         """
@@ -253,6 +206,11 @@ class MaskGeneratingModel(nn.Module):
         for _ in range(batch_size // mini_batch_size):
             rand_ids = np.random.randint(0, batch_size, mini_batch_size)
             state = states["input_ids"][rand_ids, :], states["attention_mask"][rand_ids, :], states["context_mask"][rand_ids, :], states["response_mask"][rand_ids, :]
+            # print("actions.shape:", actions.shape)
+            # print("log_probs.shape:", log_probs.shape)
+            # print("returns.shape:", returns.shape)
+            # print("advantage.shape:", advantage.shape)
+            # print("labels.shape:", labels.shape)
 
             yield state, actions[rand_ids, :], log_probs[rand_ids, :], returns[rand_ids, :], advantage[rand_ids, :], labels[rand_ids, :]
 
@@ -276,9 +234,12 @@ class MaskGeneratingModel(nn.Module):
                 input_ids, attention_mask, context_mask, response_mask = state
                 mask = action
 
-                dist, value, policy_logits = self.get_dist_critic_for_ppo(model, state) # [N, L], [N], [N, N, L]
+                dist, value = self.get_dist_critic(model, state)
                 entropy = ((dist.entropy() * context_mask).sum(-1) / context_mask.sum(-1)).mean()
-
+                # print("dist.logits", dist.logits[0])
+                # print("context_mask * dist.entropy():", (dist.entropy() * context_mask).sum(-1))
+                # print("entropy:", entropy)
+                # print("context_mask:", context_mask.sum(-1))
                 new_log_probs = (dist.log_prob(mask) * context_mask).sum(-1) / context_mask.sum(-1) # (N,)
 
                 ratio = (new_log_probs - old_log_probs).exp()
@@ -289,11 +250,17 @@ class MaskGeneratingModel(nn.Module):
                 # learn the value function based on the estimated return
                 critic_loss = (return_ - value).pow(2).mean()
 
-                mask_loss = ((torch.sigmoid(dist.logits) * context_mask).sum(-1) / context_mask.sum(-1)).mean()
+                mask_loss = ((dist.logits * context_mask).sum(-1) / context_mask.sum(-1)).mean()
 
-                contrast_loss = calc_contrast_loss(policy_logits, context_mask, self.logit_scale.exp())
+                loss = 0.5 * critic_loss + actor_loss - 0.01 * entropy #+ 0.1 * mask_loss
 
-                loss = 0.5 * critic_loss + actor_loss - 0.001 * entropy + 0.1 * contrast_loss #+ 0.1 * mask_loss
+                # print("loss.shape", loss.shape)
+                # print("value.shape", value.shape)
+                # print("actor_loss.shape", actor_loss.shape)
+                # print("critic_loss.shape", critic_loss.shape)
+                # print("mask_loss.shape", mask_loss.shape)
+                # print("entropy.shape", entropy.shape)
+                # print("ratio.shape", ratio.shape)
 
 
                 optimizer.zero_grad()
@@ -307,8 +274,7 @@ class MaskGeneratingModel(nn.Module):
                  "returns": return_.mean().item(),
                  'entropy': entropy.item(),
                  "value": value.mean().item(),
-                 "contrast_loss": contrast_loss.item(),
-                 "mask_loss": mask_loss.item()}
+                 "mask": mask_loss.item()}
 
 
     @torch.no_grad()
@@ -333,7 +299,6 @@ class MaskGeneratingModel(nn.Module):
         # print("reward in gae:", rewards[0].shape)
         for idx, step in enumerate(reversed(range(len(rewards)))):  
             gae = rewards[step] - values[step]
-            # print("gae:", gae.mean())
 
             returns.insert(0, gae + values[step])
         
@@ -341,7 +306,7 @@ class MaskGeneratingModel(nn.Module):
 
 
     @torch.no_grad()
-    def get_action_reward(self, model, state, action, sim_gt, sim_gt2):
+    def get_action_reward(self, model, state, action, sim_gt):
         """ 
         action : mask
         state : pixel_values
@@ -349,13 +314,9 @@ class MaskGeneratingModel(nn.Module):
         mask = action
         input_ids, attention_mask, context_mask, response_mask = state
 
-        mask = (context_mask * mask + (1. - context_mask)) # do not mask the context tokens for prompting
-        masked_attention_mask = attention_mask * mask
-
         # get reward
-        sim = self.calculate_sim(model, input_ids, masked_attention_mask, response_mask, labels=input_ids)
-        reward = self.get_reward(sim, sim_gt, sim_gt2, mask, context_mask, attention_mask*(1-response_mask))
-        # print("reward:", reward.mean())
+        sim = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
+        reward = self.get_reward(sim, sim_gt, mask, context_mask)
 
         return state, reward
 
@@ -370,27 +331,19 @@ class MaskGeneratingModel(nn.Module):
         shift_response_mask = response_mask.clone()
         shift_response_mask[:, :-1] = shift_response_mask[:, 1:]
         shift_response_mask[:, -1] = 0 # mast be zero.
-
+        # print("logits.shape:", logits.shape)
+        # print('labels.shape:', labels.shape)
         sim, correct_logprob = similarity_measure(logits, labels, shift_response_mask)
-
+        # print('sim', sim.mean())
+        # print(response_mask[0])
         return sim
     
     @torch.no_grad()
-    def get_reward(self, sim, sim_gt, sim_gt2, user_input_mask, context_mask, attention_mask):
+    def get_reward(self, sim, sim_gt, user_input_mask, context_mask):
         reward = torch.exp(sim - sim_gt)
-        reward2 = torch.exp(sim_gt2 - sim_gt)
-        reward = reward - reward2
-        # reward = torch.exp(sim_gt - sim)
         factor = (user_input_mask * context_mask).sum(-1) / context_mask.sum(-1)
-        attention_sum = attention_mask.sum(-1)
-        context_sum = context_mask.sum(-1)
-        # factor = ((user_input_mask * context_mask).sum(-1) + attention_sum - context_sum) / attention_sum
-        # factor = ((1 - user_input_mask) * context_mask).sum(-1) / attention_sum
         reward = reward * (1 / (factor+1e-5))
-        # reward = reward * (1 / (factor**2 + 1e-5))
         # print("reward:", reward.shape)
-        # print("reward:", reward.mean())
-        # print("factor:", factor.mean())
 
         return reward
 
@@ -409,14 +362,13 @@ class MaskGeneratingModel(nn.Module):
 
         state = input_ids, attention_mask, context_mask, response_mask
         sim_gt = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
-        sim_gt2 = self.calculate_sim(model, input_ids, attention_mask * (1-context_mask), response_mask, labels=input_ids)
     
         with torch.no_grad():
             for step in range(num_steps):
                 dist, value = self.get_dist_critic(model, state)
                 action = dist.sample()
                 action = action * context_mask
-                next_state, reward = self.get_action_reward(model, state, action, sim_gt, sim_gt2)
+                next_state, reward = self.get_action_reward(model, state, action, sim_gt)
 
                 # log_prob = dist.log_prob(action).sum(-1, keepdim=True)
                 log_prob = (dist.log_prob(action) * context_mask).sum(-1) / context_mask.sum(-1) # (N,)
@@ -492,6 +444,22 @@ class MaskGeneratingModel(nn.Module):
         # mask_probs = torch.clamp(mask_probs, 0, 0.85)
         mask = torch.bernoulli(mask_probs) # (batch_size, seq_len)
 
+        # mask_probs = mask_probs * context_mask
+        # k_ratio = 0.5
+        # # k_values = (k_ratio * context_mask.sum(-1)).int()
+        # k_values = 20 * torch.ones_like(context_mask.sum(-1)).int()
+        # # print(k_values)
+        # mask = torch.zeros_like(mask_logits)
+        # for i in range(mask_logits.size(0)):
+        #     top_k_values, top_k_indices = torch.topk(mask_probs[i], k=max(1, k_values[i]), dim=-1)
+        #     mask[i, top_k_indices] = 1
+        # # generate a mask of shape mask_probs with probability 0.6
+        # bernoulli_mask = torch.bernoulli(torch.ones_like(mask_probs) * 0.5)
+        # # Top k% of candidate mask then randomly sample 60% of the candidates as the mask
+        # mask = mask * bernoulli_mask 
+        # mask_ratio = mask.sum(-1) / context_mask.sum(-1)
+
+        # mask = 1 - mask
 
         mask = (context_mask * mask + (1. - context_mask)) # do not mask the context tokens for prompting
         # print(context_mask[0])
