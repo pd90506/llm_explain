@@ -75,7 +75,7 @@ def calc_contrast_loss(h, context_mask, temperature):
     # similarity_matrix = mean_scores * temperature
     similarity_matrix = mean_scores
     # print("similarity_matrix.shape", similarity_matrix.shape)
-    print("similarity_matrix", similarity_matrix[:2, :2])
+    # print("similarity_matrix", similarity_matrix[:2, :2])
 
     labels = torch.eye(N, dtype=torch.float32, device=similarity_matrix.device)
     # positive_loss = labels * torch.pow(1 - similarity_matrix, 2)
@@ -127,7 +127,7 @@ def get_causal_mask(inputs, attention_mask=None):
 
 
 class MaskGeneratingModel(nn.Module):
-    def __init__(self, hidden_size=64):
+    def __init__(self, hidden_size=512):
         """ 
         hidden_size: int
             The hidden size of the output of the generative model, 4096 for llama3
@@ -171,20 +171,11 @@ class MaskGeneratingModel(nn.Module):
         """
         # convert to low dimensional space
         hidden_states = self.reduce_map(hidden_states) # [N, L, hidden_size]
-        # hidden_states = self.layer_norm_after_reduce(hidden_states)
 
         policy_hidden_states = self.policy_states_map(hidden_states) # [N, L, hidden_size]
-        policy_states = pairwise_token_attention(policy_hidden_states, context_mask, response_mask, self.logit_scale) # [N, N, L]
-        # policy_states = pairwise_token_attention(policy_hidden_states, context_mask, response_mask) # [N, N, L, hidden_size]
-        # policy_states = self.layer_norm_policy(policy_states) # [N, N, L, hidden_size]
+        # policy_states = pairwise_token_attention(policy_hidden_states, context_mask, response_mask, self.logit_scale) # [N, N, L]
+        policy_logits = self.policy_map(policy_hidden_states).squeeze(-1) # [N, L]
 
-        # policy_logits = self.policy_map(policy_states).squeeze(-1) # [N, N, L]
-
-        # Calculate the value function
-        # print("policy_states", policy_states.shape)
-        # value_hidden_states = torch.diagonal(policy_states, offset=0, dim1=0, dim2=1).permute(2, 0, 1) # [N, L, hidden_size]
-        # print("value_hidden_states", value_hidden_states.shape)
-        # value_hidden_states = self.value_layer_norm(value_hidden_states)
         combined_mask = torch.clamp(context_mask + response_mask, 0, 1) # [N, L]
         value_hidden_states = policy_hidden_states * combined_mask.unsqueeze(-1) # [N, L, hidden_size]
 
@@ -192,7 +183,7 @@ class MaskGeneratingModel(nn.Module):
         value = (value * context_mask).sum(-1) / (context_mask.sum(-1) + 1e-5) # [N]
 
 
-        return policy_states, value # [N, N, L], [N,]
+        return policy_logits, value # [N, N, L], [N,]
 
     def get_dist_critic(self, model, state):
         """ 
@@ -207,32 +198,32 @@ class MaskGeneratingModel(nn.Module):
         
         policy_logits, value = self.forward(last_hidden_state, context_mask, response_mask=response_mask)
         # print("policy_logits_origin", policy_logits[0][:5][:10])
-        policy_logits = torch.diagonal(policy_logits, offset=0, dim1=0, dim2=1).permute(1,0) # [N, L]
+        # policy_logits = torch.diagonal(policy_logits, offset=0, dim1=0, dim2=1).permute(1,0) # [N, L]
         # print("policy_logits", policy_logits[0][:100])
         # policy_logits = policy_logits * self.logit_scale.exp()
 
-        dist = Bernoulli(probs=policy_logits) # [N, L]
+        dist = Bernoulli(logits=policy_logits) # [N, L]
 
         return dist, value
 
-    def get_dist_critic_for_ppo(self, model, state):
-        """ 
-        model: The Llama3 model to generate the logits
-        state: The input state, consisting of input_ids, attention_mask, context_mask, response_mask
-        """
-        input_ids, attention_mask, context_mask, response_mask = state
-        # Extract features from the model
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
-            last_hidden_state = outputs.hidden_states[-1].float() # [N, L, hidden_size]
+    # def get_dist_critic_for_ppo(self, model, state):
+    #     """ 
+    #     model: The Llama3 model to generate the logits
+    #     state: The input state, consisting of input_ids, attention_mask, context_mask, response_mask
+    #     """
+    #     input_ids, attention_mask, context_mask, response_mask = state
+    #     # Extract features from the model
+    #     with torch.no_grad():
+    #         outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
+    #         last_hidden_state = outputs.hidden_states[-1].float() # [N, L, hidden_size]
         
-        policy_logits, value = self.forward(last_hidden_state, context_mask, response_mask=response_mask)
-        diagonal_logits = torch.diagonal(policy_logits, offset=0, dim1=0, dim2=1).permute(1,0) # [N, L]
-        # diagonal_logits = diagonal_logits * self.logit_scale.exp()
+    #     policy_logits, value = self.forward(last_hidden_state, context_mask, response_mask=response_mask)
+    #     diagonal_logits = torch.diagonal(policy_logits, offset=0, dim1=0, dim2=1).permute(1,0) # [N, L]
+    #     # diagonal_logits = diagonal_logits * self.logit_scale.exp()
 
-        dist = Bernoulli(probs=diagonal_logits) # [N, L]
+    #     dist = Bernoulli(probs=diagonal_logits) # [N, L]
 
-        return dist, value, policy_logits
+    #     return dist, value, policy_logits
     
     def ppo_iter(self, mini_batch_size, states, actions, log_probs, returns, advantage, labels):
         """
@@ -276,7 +267,8 @@ class MaskGeneratingModel(nn.Module):
                 input_ids, attention_mask, context_mask, response_mask = state
                 mask = action
 
-                dist, value, policy_logits = self.get_dist_critic_for_ppo(model, state) # [N, L], [N], [N, N, L]
+                # dist, value, policy_logits = self.get_dist_critic_for_ppo(model, state) # [N, L], [N], [N, N, L]
+                dist, value = self.get_dist_critic(model, state) # [N, L], [N]
                 entropy = ((dist.entropy() * context_mask).sum(-1) / context_mask.sum(-1)).mean()
 
                 new_log_probs = (dist.log_prob(mask) * context_mask).sum(-1) / context_mask.sum(-1) # (N,)
@@ -289,11 +281,14 @@ class MaskGeneratingModel(nn.Module):
                 # learn the value function based on the estimated return
                 critic_loss = (return_ - value).pow(2).mean()
 
-                mask_loss = ((torch.sigmoid(dist.logits) * context_mask).sum(-1) / context_mask.sum(-1)).mean()
+                mask_mean = (torch.sigmoid(dist.logits) * context_mask).sum(-1) / context_mask.sum(-1) # (N,)
+                mask_loss = mask_mean.mean()
+                std_mean = ((torch.sigmoid(dist.logits) - mask_mean.unsqueeze(-1)).pow(2) * context_mask).sum(-1) / context_mask.sum(-1) # (N,)
+                std_loss = torch.sqrt(std_mean).mean()
 
-                contrast_loss = calc_contrast_loss(policy_logits, context_mask, self.logit_scale.exp())
+                # contrast_loss = calc_contrast_loss(policy_logits, context_mask, self.logit_scale.exp())
 
-                loss = 0.5 * critic_loss + actor_loss - 0.001 * entropy + 0.1 * contrast_loss #+ 0.1 * mask_loss
+                loss = 0.5 * critic_loss + actor_loss - 0.0001 * entropy #+ 0.001 * mask_loss
 
 
                 optimizer.zero_grad()
@@ -307,8 +302,9 @@ class MaskGeneratingModel(nn.Module):
                  "returns": return_.mean().item(),
                  'entropy': entropy.item(),
                  "value": value.mean().item(),
-                 "contrast_loss": contrast_loss.item(),
-                 "mask_loss": mask_loss.item()}
+                #  "contrast_loss": contrast_loss.item(),
+                 "mask_loss": mask_loss.item(),
+                 "std_loss": std_loss.item()}
 
 
     @torch.no_grad()
@@ -376,14 +372,15 @@ class MaskGeneratingModel(nn.Module):
         return sim
     
     @torch.no_grad()
-    def get_reward(self, sim, sim_gt, sim_gt2, user_input_mask, context_mask, attention_mask):
-        reward = torch.exp(sim - sim_gt)
-        reward2 = torch.exp(sim_gt2 - sim_gt)
-        reward = reward - reward2
+    def get_reward(self, sim, sim_upper, sim_lower, user_input_mask, context_mask, attention_mask):
+        reward_raw = torch.exp(sim - sim_lower)
+        reward_range = torch.exp(sim_upper - sim_lower)
+        # reward = reward / (reward2 + 1e-5)
+        reward = reward_raw / (reward_range + 1e-5)
         # reward = torch.exp(sim_gt - sim)
         factor = (user_input_mask * context_mask).sum(-1) / context_mask.sum(-1)
-        attention_sum = attention_mask.sum(-1)
-        context_sum = context_mask.sum(-1)
+        # attention_sum = attention_mask.sum(-1)
+        # context_sum = context_mask.sum(-1)
         # factor = ((user_input_mask * context_mask).sum(-1) + attention_sum - context_sum) / attention_sum
         # factor = ((1 - user_input_mask) * context_mask).sum(-1) / attention_sum
         reward = reward * (1 / (factor+1e-5))
@@ -408,15 +405,15 @@ class MaskGeneratingModel(nn.Module):
 
 
         state = input_ids, attention_mask, context_mask, response_mask
-        sim_gt = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
-        sim_gt2 = self.calculate_sim(model, input_ids, attention_mask * (1-context_mask), response_mask, labels=input_ids)
+        sim_upper = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
+        sim_lower = self.calculate_sim(model, input_ids, attention_mask * (1-context_mask), response_mask, labels=input_ids)
     
         with torch.no_grad():
             for step in range(num_steps):
                 dist, value = self.get_dist_critic(model, state)
                 action = dist.sample()
                 action = action * context_mask
-                next_state, reward = self.get_action_reward(model, state, action, sim_gt, sim_gt2)
+                next_state, reward = self.get_action_reward(model, state, action, sim_upper, sim_lower)
 
                 # log_prob = dist.log_prob(action).sum(-1, keepdim=True)
                 log_prob = (dist.log_prob(action) * context_mask).sum(-1) / context_mask.sum(-1) # (N,)
