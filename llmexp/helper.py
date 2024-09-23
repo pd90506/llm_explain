@@ -1,84 +1,200 @@
 import torch
 
-class LlmExpHelper:
-    def __init__(self, tokenizer, dataset):
-        self.tokenizer = tokenizer
-        self.dataset = dataset
+
+def template_fn(messages):
+    # Initialize the results dictionary with lists
+    results = {
+        'result': [],
+        'start': [],
+        'end': []
+    }
     
-    def get_collate_fun(self):
-        return lambda examples: self.collate_fn(examples)
+    # Get the list of contexts and user messages
+    contexts = messages.get('context', [])
+    user_messages = messages.get('user_message', [])
+    
+    # Ensure both lists are of the same length
+    if len(contexts) != len(user_messages):
+        raise ValueError("The 'context' and 'user_message' lists must be of the same length.")
+    
+    # Iterate over the indices
+    for idx in range(len(contexts)):
+        context = contexts[idx]
+        user_message = user_messages[idx]
+        
+        # Define the template components
+        part1 = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        part2 = f"{context}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        part3 = user_message
+        part4 = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+        
+        # Combine parts to form the full template
+        result = part1 + part2 + part3 + part4
+        
+        # Calculate start and end indices of the user_message
+        user_message_start = len(part1 + part2)
+        user_message_end = user_message_start + len(user_message)
+        
+        # Append to results
+        results['result'].append(result)
+        results['start'].append(user_message_start)
+        results['end'].append(user_message_end)
+        
+    return results
 
-    def collate_fn(self, examples):
-        def num_words(x):
-            return len(x.split())
-        def get_first_k_words(x, k):
-            return ' '.join(x.split()[:k])
-        def get_cliped_text(texts, max_len):
-            return [text if num_words(text) <= max_len else get_first_k_words(text, max_len) for text in texts]
+
+class DataHelper():
+    def __init__(self, tokenizer, template=None, max_seq_len=512):
+        self.tokenizer = tokenizer
+
+        self.template = template if template is not None else template_fn
+        self.max_seq_len = max_seq_len
+
+    def get_collate_fun(self, dataset):
+        if dataset == 'imdb':
+            return self.collate_fn_imdb
+        elif dataset == 'sst2':
+            return self.collate_fn_sst2
+        elif dataset == 'squad':
+            return self.collate_fn_squad
+        else:
+            raise ValueError(f"Unsupported dataset: {dataset}")
+
+    def collate_fn_imdb(self, examples):
+        return self._collate_fn_generic(
+            examples,
+            text_key='text',
+            sys_context=(
+                "You are a chatbot for sentiment analysis. "
+                "You can help users with their questions via concise responses of POSITIVE or NEGATIVE."
+            )
+        )
+
+    def collate_fn_sst2(self, examples):
+        return self._collate_fn_generic(
+            examples,
+            text_key='sentence',
+            sys_context=(
+                "You are a chatbot for sentiment analysis. "
+                "You can help users with their questions via concise responses of POSITIVE or NEGATIVE."
+            )
+        )
+
+    def collate_fn_squad(self, examples):
         tokenizer = self.tokenizer
-        max_len = 512 # characters limit other than token limit
-        if self.dataset == 'imdb':
-            texts = [example['text'] for example in examples]
-            texts = get_cliped_text(texts, max_len)
-            sys_context = "You are a chatbot for sentiment analysis. You can help users with their questions via concise responses of POSITIVE, or NEGATIVE."
-        elif self.dataset == 'sst2':
-            texts = [example['sentence'] for example in examples]
-            texts = get_cliped_text(texts, max_len)
-            sys_context = "You are a chatbot for sentiment analysis. You can help users with their questions via concise responses of POSITIVE, or NEGATIVE."
-        elif self.dataset == 'squad':
-            context = [example['context'] for example in examples]
-            context = get_cliped_text(context, max_len)
-            question = [example['question'] for example in examples]
-            # texts = [f"Context: {context[i]}\nQuestion: {question[i]}" for i in range(len(context))]
-            texts = [f"Question: {question[i]}\nContext: {context[i]}" for i in range(len(context))]
-            sys_context = "You are a chatbot for answering questions. You can help users with their questions via concise responses."
+        max_words = 512
 
-        # labels = [example['label'] for example in examples]
-        messages_lambda = lambda texts: [
-            {"role": "system", "content": sys_context},
-            {"role": "user", "content": texts},
+        def get_clipped_texts(texts):
+            return [
+                ' '.join(text.split()[:max_words]) if len(text.split()) > max_words else text
+                for text in texts
+            ]
+
+        contexts = [example['context'] for example in examples]
+        # contexts = examples['context']
+        questions = [example['question'] for example in examples]
+        # questions = examples['question']
+        contexts = get_clipped_texts(contexts)
+        texts = [
+            f"Question: {questions[i]}\nContext: {contexts[i]}"
+            for i in range(len(examples['id']))
+        ]
+        sys_context = (
+            "You are a chatbot for answering questions. "
+            "You can help users with their questions via concise responses."
+        )
+
+        # Create messages
+        messages = [
+            [
+                {"role": "system", "content": sys_context},
+                {"role": "user", "content": text},
+            ]
+            for text in texts
         ]
 
-        messages = list(map(messages_lambda, texts))
-
-        messages_with_template_applied = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+        # Apply chat template
+        messages_with_template = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
+
+        # Tokenize messages
         batch = tokenizer(
-                    messages_with_template_applied,
-                    add_special_tokens=False,
-                    padding=True,
-                    return_tensors="pt",
-                    )
-        
-        # find the template boundaries
+            messages_with_template,
+            add_special_tokens=False,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        # Update context mask for 'squad' dataset
+        context_lens = [len(tokenizer.encode(ctx)) for ctx in contexts]
+        context_lens_tensor = torch.tensor(context_lens, dtype=torch.long)
+        mask_tensor_v2 = self._apply_mask(
+            torch.ones_like(batch['input_ids']), context_lens_tensor
+        )
+        batch['context_mask'] = mask_tensor_v2 * batch['attention_mask']
+
+        return batch
+
+    def _collate_fn_generic(self, examples, text_key, sys_context):
+        tokenizer = self.tokenizer
+        max_seq_len = self.max_seq_len
+
+        def get_clipped_texts(texts):
+            """
+            Clip texts to max_seq_len tokens.
+            """
+            max_tokens = max_seq_len
+            tokenizer = self.tokenizer 
+            clipped_texts = []
+            for text in texts:
+                token_ids = tokenizer.encode(text)
+                if len(token_ids) > max_tokens:
+                    token_ids = token_ids[:max_tokens]
+                    clipped_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+                else:
+                    clipped_text = text
+                clipped_texts.append(clipped_text)
+            return clipped_texts
+
+        texts = [example[text_key] for example in examples]
+        # texts = examples[text_key]
+        texts = get_clipped_texts(texts)
+        sys_context = [sys_context] * len(texts)
+
+        # Create messages
+        messages = {
+            "context": sys_context,
+            "user_message": texts,
+        }
+
+        # Apply chat template
+        messages_with_template_tuple = self.template(messages)
+        messages_with_template = messages_with_template_tuple['result']
+        # user_message_starts = messages_with_template_tuple['start']
+        # user_message_ends = messages_with_template_tuple['end']   
+
+        # Tokenize messages
+        batch = tokenizer(
+            messages_with_template,
+            add_special_tokens=False,
+            padding=True,
+            return_tensors="pt",
+        )
+
         text_lens = [len(tokenizer.encode(text)) for text in texts]
         text_lens_tensor = torch.tensor(text_lens, dtype=torch.long)
 
-        
-        def apply_mask(mask_tensor, text_lens_tensor):
-            batch_size, seq_len = mask_tensor.shape
-            for i in range(batch_size):
-                text_len = text_lens_tensor[i].item()
-                mask_tensor[i, -text_len-5:-5] = 0
-            return 1- mask_tensor
 
-        mask_tensor = apply_mask(torch.ones_like(batch['input_ids']), text_lens_tensor)
+        mask_tensor = self._apply_mask(torch.ones_like(batch['input_ids']), text_lens_tensor)
 
         batch['context_mask'] = mask_tensor
 
-        if self.dataset == 'squad':
-            answers_start = [example['answers']['answer_start'][0] for example in examples]
-            answers_end = [example['answers']['answer_start'][0] + len(example['answers']['text'][0]) for example in examples]
-            batch['answers_start'] = torch.tensor(answers_start).long()
-            batch['answers_end'] = torch.tensor(answers_end).long()
-
-            context_lens = [len(tokenizer.encode(context)) for context in context]
-            context_lens_tensor = torch.tensor(context_lens, dtype=torch.long)
-            mask_tensor_v2 = apply_mask(torch.ones_like(batch['input_ids']), context_lens_tensor)
-            batch['context_mask'] = mask_tensor_v2 * batch['attention_mask']
-            
-        
         return batch
+
+    def _apply_mask(self, mask_tensor, lens_tensor):
+        batch_size, seq_len = mask_tensor.shape
+        for i in range(batch_size):
+            text_len = lens_tensor[i].item()
+            mask_tensor[i, -text_len - 5 : -5] = 0
+        return 1 - mask_tensor
