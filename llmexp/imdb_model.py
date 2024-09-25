@@ -15,75 +15,33 @@ import numpy as np
 import torch.utils.checkpoint as checkpoint
 
 
-def pairwise_token_attention(h, context_mask, response_mask, logit_scale):
-    """
-    h: torch.Tensor, shape (batch_size, seq_len, hidden_size)
-    context_mask: torch.Tensor, shape (batch_size, seq_len)
-    response_mask: torch.Tensor, shape (batch_size, seq_len)
-    """
-    N, L, d = h.shape
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_blocks=5, bottleneck_dim=64):
+        super(MLP, self).__init__()
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
 
-    # calculate pairwise attention scores，(N, N, L, L)
-    h = F.normalize(h, p=2, dim=-1) # (N, L, d)
-    h1 = h * context_mask.unsqueeze(-1)
-    h2 = h * response_mask.unsqueeze(-1)
-    scores = torch.einsum('ikd,jld->ijkl', h1, h2) # (N, N, L, L)
-    # scores = scores / torch.sqrt(torch.tensor(d, dtype=torch.float32)) # (N, N, L, L)
-    scores = scores.sum(-1, keepdim=True) / response_mask.unsqueeze(0).unsqueeze(2).sum(-1,keepdim=True) # (N, N, L, 1)
-    # scores = scores.sum(-2, keepdim=True) / context_mask.unsqueeze(1).unsqueeze(3).sum(-2, keepdim=True) # (N, N, 1, 1)
-    # scores = scores.squeeze(-1).squeeze(-1) # (N, N)
-    scores = scores.squeeze(-1) # (N, N, L) (ijk)
-    scores = torch.clamp((scores + 1) / 2, 0, 1)  # range (0, 1)
+        self.attention_layers = nn.ModuleList()
+        self.layers = nn.ModuleList()
+        for _ in range(num_blocks):
+            shortcut_layers = []
+            shortcut_layers.append(nn.LayerNorm(hidden_dim))
+            shortcut_layers.append(nn.PReLU())
+            shortcut_layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
+            shortcut_layers.append(nn.LayerNorm(hidden_dim))
+            self.attention_layers.append(nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True, bias=False))
+            self.layers.append(nn.Sequential(*shortcut_layers))
 
-    # print_scores = scores.sum(-1) / context_mask.sum(-1).unsqueeze(1)
-    # print_scores = print_scores * logit_scale.exp()
-    # print("scores", print_scores[:2, :2])
-    return scores # (N, N, L) (ijk)
-
-    # # Expanding context_mask to match the dimensions of scores: (N, 1, L, 1)
-    # context_mask_expanded = context_mask.unsqueeze(1).unsqueeze(-1).expand(N, N, L, L)
-    # # Expanding response_mask to match the dimensions of scores: (1, N, 1, L)
-    # response_mask_expanded = response_mask.unsqueeze(0).unsqueeze(2).expand(N, N, L, L)
-
-    # # Applying masks: set scores to -inf where the masks are 0
-    # scores_context_masked = scores.masked_fill(context_mask_expanded == 0, float('-inf'))
-    # scores_response_masked = scores.masked_fill(response_mask_expanded == 0, float('-inf'))
-
-    # weights_context = F.softmax(scores_response_masked, dim=-1) # (N, N, L, L)
-    # weights_response = F.softmax(scores_context_masked, dim=-2) # (N, N, L, L)
-
-    # # calculate the output of the pairwise attention
-    # output_context = torch.matmul(weights_context, h2.unsqueeze(0)) # (N, N, L, d) (ijkl, ijld->ijkd)
-    # output_response = torch.matmul(weights_response.permute(0,1,3,2), h1.unsqueeze(1)) # (N, N, L, d) (ijlk, ijkd->ijld)
-
-    # output = F.normalize(output, p=2, dim=-1) # (N, N, L, d)
-    # print("output", output[0, 0, :, 0])
-
-    # return output
-
-def calc_contrast_loss(h, context_mask, temperature):
-    """ 
-    h: torch.Tensor, shape (N, N, L)
-    context_mask: torch.Tensor, shape (N, L)
-    """
-    margin = 0.1
-    N, _, L = h.shape
-    h = h * context_mask.unsqueeze(1) # (N, N, L)
-    mean_scores = h.sum(-1) / context_mask.sum(-1).unsqueeze(1) # (N, N)
-
-    # calculate contrast loss
-    # similarity_matrix = mean_scores * temperature
-    similarity_matrix = mean_scores
-    # print("similarity_matrix.shape", similarity_matrix.shape)
-    # print("similarity_matrix", similarity_matrix[:2, :2])
-
-    labels = torch.eye(N, dtype=torch.float32, device=similarity_matrix.device)
-    # positive_loss = labels * torch.pow(1 - similarity_matrix, 2)
-    # negative_loss = (1 - labels) * torch.pow(torch.clamp(similarity_matrix - margin, min=0.0), 2)
-
-    # contrast_loss = torch.mean(positive_loss + negative_loss)
-    contrast_loss = torch.mean(torch.pow(similarity_matrix - labels, 2))
-    return contrast_loss
+        self.output_layer= nn.Linear(hidden_dim, output_dim, bias=False)
+        # self.output_w = nn.Parameter(torch.randn(hidden_dim, output_dim))
+        
+    def forward(self, x):
+        x = self.input_layer(x)
+        for idx, layer in enumerate(self.layers):
+            x = x + layer(self.attention_layers[idx](x, x, x)[0]) # shortcut
+        # x = F.normalize(x, p=2, dim=-1)
+        # w = F.normalize(self.output_w, p=2, dim=0)
+        # x = x @ w
+        return self.output_layer(x)
 
 
 def similarity_measure(logits, labels, attention_mask):
@@ -97,13 +55,17 @@ def similarity_measure(logits, labels, attention_mask):
         mean_log_probs: torch.Tensor, shape (batch_size,)
     """
     log_probs = torch.log_softmax(logits, dim=-1)
+    # print('log_probs.shape', log_probs.shape)
 
     label_safe = torch.clamp(labels, min=0)
     selected_log_probs = torch.gather(log_probs, dim=-1, index=label_safe.unsqueeze(-1)).squeeze(-1)  # (N, L)
     selected_log_probs[labels == -100] = 0
+    # print('selected_log_probs.shape', selected_log_probs.shape)
 
     mean_log_probs = (selected_log_probs * attention_mask).sum(-1) / attention_mask.sum(-1)
+    # print('mean_log_probs.shape', mean_log_probs.shape)
     # sum_log_probs = (selected_log_probs * attention_mask).sum(-1)
+    # print("mean_log_probs", mean_log_probs[:1])
 
 
     return mean_log_probs, selected_log_probs
@@ -143,24 +105,37 @@ class MaskGeneratingModelForIMDB(nn.Module):
         # self.lm_head.weight = torch.nn.Parameter(emb_weights)
         # # freeze lm_head.weight 
         # self.lm_head.weight.requires_grad = False
-        self.reduce_map = nn.Sequential(nn.Linear(4096, 2048),
-                                        nn.ReLU(),
-                                        nn.Linear(2048, 1024),
-                                        nn.ReLU(),
-                                        nn.Linear(1024, hidden_size))
+        # self.reduce_map = nn.Sequential(nn.Linear(4096, 2048),
+        #                                 nn.ReLU(),
+        #                                 nn.Linear(2048, 1024),
+        #                                 nn.ReLU(),
+        #                                 nn.Linear(1024, hidden_size))
+        self.reduce_map = MLP(input_dim=4096, 
+                               hidden_dim=512, 
+                               output_dim=hidden_size, 
+                               num_blocks=2, 
+                               bottleneck_dim=64) 
+        
+        self.reduce_map_value = MLP(input_dim=4096, 
+                               hidden_dim=512, 
+                               output_dim=hidden_size, 
+                               num_blocks=2, 
+                               bottleneck_dim=64) 
         # self.reduce_map = nn.Linear(4096, hidden_size)
        
         self.policy_states_map = nn.Sequential(nn.Linear(hidden_size, hidden_size),
                                         nn.ReLU(),
                                         nn.Linear(hidden_size, hidden_size))
-        self.layer_norm_policy = nn.LayerNorm(hidden_size)
+        # self.layer_norm_policy = nn.LayerNorm(hidden_size)
 
         self.policy_map = nn.Linear(hidden_size, 1)
-        self.value_map = nn.Linear(hidden_size, 1)
+        self.value_map = nn.Linear(4096, 1)
         
-        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+        # self.logit_scale = nn.Parameter(torch.tensor(1.0))
 
-        self.value_layer_norm = nn.LayerNorm(hidden_size)
+        # self.value_layer_norm = nn.LayerNorm(hidden_size)
+
+        self.mask_token_id = 128009
 
     
     def forward(self, hidden_states: torch.Tensor, context_mask: torch.Tensor, response_mask: torch.Tensor):
@@ -171,18 +146,32 @@ class MaskGeneratingModelForIMDB(nn.Module):
         labels: torch.Tensor of shape [N, L]
         """
         # convert to low dimensional space
-        hidden_states = self.reduce_map(hidden_states) # [N, L, hidden_size]
+        reduced_hidden_states = self.reduce_map(hidden_states) # [N, L, hidden_size]
 
-        policy_hidden_states = self.policy_states_map(hidden_states) # [N, L, hidden_size]
-        policy_hidden_states = self.layer_norm_policy(policy_hidden_states)
+        policy_hidden_states = self.policy_states_map(reduced_hidden_states) # [N, L, hidden_size]
+        # policy_hidden_states = self.layer_norm_policy(policy_hidden_states)
         # policy_states = pairwise_token_attention(policy_hidden_states, context_mask, response_mask, self.logit_scale) # [N, N, L]
         policy_logits = self.policy_map(policy_hidden_states).squeeze(-1) # [N, L]
 
-        combined_mask = torch.clamp(context_mask + response_mask, 0, 1) # [N, L]
-        value_hidden_states = policy_hidden_states * combined_mask.unsqueeze(-1) # [N, L, hidden_size]
+        # combined_mask = torch.clamp(context_mask + response_mask, 0, 1) # [N, L]
+        # value_hidden_states = policy_hidden_states * combined_mask.unsqueeze(-1) # [N, L, hidden_size]
+        # value_hidden_states = (value_hidden_states * combined_mask.unsqueeze(-1)).sum(-2) / (combined_mask.unsqueeze(-1).sum(-2) + 1e-5) # [N, hidden_size]
+        def get_pooled_feature(hidden_states, response_mask):
+            """ 
+            Obtain the last non-padded token of the sequence
+            """
+            # reverse
+            batch_size = hidden_states.shape[0]
+            device = hidden_states.device
+            reverse_response_mask = torch.flip(response_mask, dims=[-1])
+            first_non_pad_from_right = reverse_response_mask.argmax(-1)
+            # reverse back
+            first_non_pad_position = response_mask.shape[-1] - first_non_pad_from_right - 1
+            first_non_pad_position = first_non_pad_position.to(device)
+            pooled_feature = hidden_states[torch.arange(batch_size, device=device), first_non_pad_position]
+            return pooled_feature
 
-        
-        value_hidden_states = (value_hidden_states * combined_mask.unsqueeze(-1)).sum(-2) / (combined_mask.unsqueeze(-1).sum(-2) + 1e-5) # [N, hidden_size]
+        value_hidden_states = get_pooled_feature(hidden_states, response_mask)
         value = self.value_map(value_hidden_states).squeeze(-1) # [N,]
 
 
@@ -250,7 +239,7 @@ class MaskGeneratingModelForIMDB(nn.Module):
 
             yield state, actions[rand_ids, :], log_probs[rand_ids, :], returns[rand_ids, :], advantage[rand_ids, :], labels[rand_ids, :]
 
-    def ppo_update(self, model, optimizer, ppo_epochs, mini_batch_size, states, actions, log_probs, returns, advantages, labels, clip_param=0.02):
+    def ppo_update(self, model, optimizer, ppo_epochs, mini_batch_size, states, actions, log_probs, returns, advantages, labels, clip_param=0.2):
         """
         Perform PPO (Proximal Policy Optimization) update for the given number of epochs.
         Parameters:
@@ -286,7 +275,9 @@ class MaskGeneratingModelForIMDB(nn.Module):
                 # print("new_log_probs", new_log_probs.squeeze(-1).data)
                 # print("old_log_probs", old_log_probs.squeeze(-1).data)
                 # print('ratio', ratio.squeeze(-1).data)
-                surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantage
+                # clip = clip_param / torch.sqrt(context_mask.sum(-1, keepdim=True))
+                clip = clip_param * 0.1
+                surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * advantage
                 # PPO step
                 actor_loss  = - torch.min(surr1, surr2).mean()
                 # learn the value function based on the estimated return
@@ -348,7 +339,7 @@ class MaskGeneratingModelForIMDB(nn.Module):
 
 
     @torch.no_grad()
-    def get_action_reward(self, model, state, action, sim_gt, sim_gt2):
+    def get_action_reward(self, model, state, action, sim_upper, sim_lower):
         """ 
         action : mask
         state : pixel_values
@@ -356,12 +347,16 @@ class MaskGeneratingModelForIMDB(nn.Module):
         mask = action
         input_ids, attention_mask, context_mask, response_mask = state
 
-        mask = (context_mask * mask + (1. - context_mask)) # do not mask the context tokens for prompting
-        masked_attention_mask = attention_mask * mask
+        # mask = (context_mask * mask + (1. - context_mask)) # do not mask the context tokens for prompting
+        # masked_attention_mask = attention_mask * mask
+        to_be_masked = (1 - mask) * context_mask
+
+        masked_input_ids = input_ids.clone()
+        masked_input_ids[to_be_masked == 1] = self.mask_token_id
 
         # get reward
-        sim = self.calculate_sim(model, input_ids, masked_attention_mask, response_mask, labels=input_ids)
-        reward = self.get_reward(sim, sim_gt, sim_gt2, action, context_mask, attention_mask*(1-response_mask))
+        sim = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
+        reward = self.get_reward(sim, sim_upper, sim_lower, action, context_mask, attention_mask*(1-response_mask))
         # print("reward:", reward.mean())
 
         return state, reward
@@ -387,8 +382,12 @@ class MaskGeneratingModelForIMDB(nn.Module):
     
     @torch.no_grad()
     def get_reward(self, sim, sim_upper, sim_lower, user_input_mask, context_mask, attention_mask):
-        reward_raw = torch.relu(torch.exp(sim - sim_lower) - 1)
-        reward_range = torch.relu(torch.exp(sim_upper - sim_lower) - 1)
+        # print('sim', sim[:1])
+        # print('sim_upper', sim_upper[:1])
+        # print('sim_lower', sim_lower[:1])
+        # reward_raw = torch.relu(torch.exp(sim - sim_lower) - 1)
+        # reward_range = torch.relu(torch.exp(sim_upper - sim_lower))
+        reward_raw = torch.exp(sim - sim_upper) - torch.exp(sim_lower - sim_upper)
         # reward_range = torch.exp(sim_upper - sim_lower)
         # reward = reward / (reward2 + 1e-5)
         # reward = reward_raw #/ (reward_range + 1e-5)
@@ -397,19 +396,20 @@ class MaskGeneratingModelForIMDB(nn.Module):
         # reward = torch.exp(sim - sim_upper)
         # reward = torch.exp(sim_gt - sim)
         factor = ((user_input_mask * context_mask).sum(-1)) / context_mask.sum(-1)
+        inverse_factor = torch.where(factor == 0, torch.zeros_like(factor), 1 / factor)
         # attention_sum = attention_mask.sum(-1)
         # context_sum = context_mask.sum(-1)
         # factor = ((user_input_mask * context_mask).sum(-1) + attention_sum - context_sum) / attention_sum
         # factor = ((1 - user_input_mask) * context_mask).sum(-1) / attention_sum
         # print("reward_original", reward.mean())
         # reward = reward * (1 / (factor+1e-5))
-        reward = reward_raw / (reward_range + 1)
-        reward = reward * (1 / (factor+1e-5))
+        # reward = reward_raw / (reward_range + 1)
+        reward = reward_raw
+        reward = reward * inverse_factor
         # reward = reward - factor
         # reward = reward * (1 / (factor**2 + 1e-5))
         # print("reward:", reward.shape)
-        print("reward:", reward.mean())
-        print("factor:", factor.mean())
+        print("reward:", reward.mean(), "factor:", factor.mean())
 
         return reward
 
@@ -428,7 +428,11 @@ class MaskGeneratingModelForIMDB(nn.Module):
 
         state = input_ids, attention_mask, context_mask, response_mask
         sim_upper = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
-        sim_lower = self.calculate_sim(model, input_ids, attention_mask * (1-context_mask), response_mask, labels=input_ids)
+
+        to_be_masked = context_mask
+        masked_input_ids = input_ids.clone()
+        masked_input_ids[to_be_masked == 1] = self.mask_token_id
+        sim_lower = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
     
         with torch.no_grad():
             for step in range(num_steps):

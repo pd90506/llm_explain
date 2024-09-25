@@ -26,7 +26,7 @@ def template_fn(messages):
         part1 = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
         part2 = f"{context}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
         part3 = user_message
-        part4 = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+        part4 = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         
         # Combine parts to form the full template
         result = part1 + part2 + part3 + part4
@@ -81,58 +81,37 @@ class DataHelper():
         )
 
     def collate_fn_squad(self, examples):
-        tokenizer = self.tokenizer
-        max_words = 512
 
-        def get_clipped_texts(texts):
-            return [
-                ' '.join(text.split()[:max_words]) if len(text.split()) > max_words else text
-                for text in texts
-            ]
+        # contexts = [example['context'] for example in examples]
+        # # contexts = examples['context']
+        # questions = [example['question'] for example in examples]
+        # # questions = examples['question']
+        # texts = [
+        #     f"Question: {questions[i]}\nContext: {contexts[i]}\n\n"
+        #     for i in range(len(examples['id']))
+        # ]
+        def combine_question_context(example):
+            example['sentence'] = f"Question: {example['question']}\nContext: {example['context']}"
+            return example
+        
+        examples_with_sentence = examples.map(combine_question_context)
 
-        contexts = [example['context'] for example in examples]
-        # contexts = examples['context']
-        questions = [example['question'] for example in examples]
-        # questions = examples['question']
-        contexts = get_clipped_texts(contexts)
-        texts = [
-            f"Question: {questions[i]}\nContext: {contexts[i]}"
-            for i in range(len(examples['id']))
-        ]
-        sys_context = (
+        batch = self._collate_fn_generic(
+            examples_with_sentence, 
+            text_key='sentence',
+            sys_context=(
             "You are a chatbot for answering questions. "
             "You can help users with their questions via concise responses."
+            )
         )
 
-        # Create messages
-        messages = [
-            [
-                {"role": "system", "content": sys_context},
-                {"role": "user", "content": text},
-            ]
-            for text in texts
-        ]
-
-        # Apply chat template
-        messages_with_template = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-
-        # Tokenize messages
-        batch = tokenizer(
-            messages_with_template,
-            add_special_tokens=False,
-            padding=True,
-            return_tensors="pt",
-        )
-
-        # Update context mask for 'squad' dataset
-        context_lens = [len(tokenizer.encode(ctx)) for ctx in contexts]
-        context_lens_tensor = torch.tensor(context_lens, dtype=torch.long)
-        mask_tensor_v2 = self._apply_mask(
-            torch.ones_like(batch['input_ids']), context_lens_tensor
-        )
-        batch['context_mask'] = mask_tensor_v2 * batch['attention_mask']
+        # # Update context mask for 'squad' dataset
+        # context_lens = [len(tokenizer.encode(ctx)) for ctx in contexts]
+        # context_lens_tensor = torch.tensor(context_lens, dtype=torch.long)
+        # mask_tensor_v2 = self._apply_mask(
+        #     torch.ones_like(batch['input_ids']), context_lens_tensor
+        # )
+        # batch['context_mask'] = mask_tensor_v2 * batch['attention_mask']
 
         return batch
 
@@ -196,5 +175,5 @@ class DataHelper():
         batch_size, seq_len = mask_tensor.shape
         for i in range(batch_size):
             text_len = lens_tensor[i].item()
-            mask_tensor[i, -text_len - 5 : -5] = 0
+            mask_tensor[i, -text_len-5+1:-5] = 0
         return 1 - mask_tensor
