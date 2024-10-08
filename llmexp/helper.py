@@ -93,15 +93,16 @@ class DataHelper():
         def combine_question_context(example):
             example['sentence'] = f"Question: {example['question']}\nContext: {example['context']}"
             return example
-        
-        examples_with_sentence = examples.map(combine_question_context)
+        # The examples is a list of dictionaries
+        # examples_with_sentence = examples.map(combine_question_context)
+        examples_with_sentence = [combine_question_context(example) for example in examples]
 
         batch = self._collate_fn_generic(
             examples_with_sentence, 
             text_key='sentence',
             sys_context=(
             "You are a chatbot for answering questions. "
-            "You can help users with their questions via concise responses."
+            "Your reply with a short answer to the question provided in the context."
             )
         )
 

@@ -61,8 +61,12 @@ def similarity_measure(logits, labels, attention_mask):
     label_safe = torch.clamp(labels, min=0)
     selected_log_probs = torch.gather(log_probs, dim=-1, index=label_safe.unsqueeze(-1)).squeeze(-1)  # (N, L)
     selected_log_probs[labels == -100] = 0
+    selected_log_probs = selected_log_probs * attention_mask
     # print('selected_log_probs.shape', selected_log_probs.shape)
-    mean_log_probs = (selected_log_probs * attention_mask).sum(-1)/ attention_mask.sum(-1)
+    # mean_log_probs = torch.exp((selected_log_probs * attention_mask).sum(-1)) ** (1/attention_mask.sum(-1))
+    # mean_log_probs = torch.log(mean_log_probs + 1e-5)
+    mean_log_probs = (selected_log_probs * attention_mask).sum(-1) / attention_mask.sum(-1)
+    # print('mean_log_probs', mean_log_probs)
     # mean_probs = (selected_log_probs.exp() * attention_mask).sum(-1) / attention_mask.sum(-1)
     # mean_log_probs = torch.log(mean_probs + 1e-5)
 
@@ -71,6 +75,12 @@ def similarity_measure(logits, labels, attention_mask):
 
     # print("mean_log_probs.shape", mean_log_probs.shape)
     # print("mean_log_probs", mean_log_probs[:1])
+    predictions = torch.argmax(logits, dim=-1)
+    correct_predictions = (predictions == labels)
+    correct_predictions = correct_predictions.int() 
+    new_response_mask = attention_mask * (1 - correct_predictions)
+
+    log_probs = log_probs * new_response_mask.unsqueeze(-1)
 
 
 
@@ -86,7 +96,7 @@ def similarity_measure(logits, labels, attention_mask):
     # print("mean_log_probs", mean_log_probs[:1])
 
 
-    return mean_log_probs, selected_log_probs
+    return mean_log_probs, selected_log_probs, log_probs, new_response_mask
 
 
 def get_causal_mask(inputs, attention_mask=None):
@@ -107,7 +117,7 @@ def get_causal_mask(inputs, attention_mask=None):
     return causal_mask # [batch_size, seq_len, seq_len]
 
 
-class MaskGeneratingModelForIMDB(nn.Module):
+class MaskGeneratingModelForInsertion(nn.Module):
     def __init__(self, hidden_size=512):
         """ 
         hidden_size: int
@@ -295,6 +305,7 @@ class MaskGeneratingModelForIMDB(nn.Module):
                 # ratio = ((new_log_probs - old_log_probs) * response_mask.sum(-1, keepdim=True)).exp()
                 ratio = (new_log_probs - old_log_probs).exp()
 
+                # print("ratio", ratio.squeeze(-1).mean())
                 surr1 = ratio * advantage
                 # print("ratio.shape", ratio.shape)
                 # print("advantage.shape", advantage.shape)
@@ -317,14 +328,12 @@ class MaskGeneratingModelForIMDB(nn.Module):
 
                 # contrast_loss = calc_contrast_loss(policy_logits, context_mask, self.logit_scale.exp())
 
-                loss = 0.5 * critic_loss + 1 *actor_loss - 0.01 * entropy #+ 0.001 * mask_loss
+                loss = 0.5 * critic_loss + 1 *actor_loss - 0.1 * entropy #+ 0.001 * mask_loss
 
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
-        print("ratio", ratio.squeeze(-1).mean())
 
         # Print the losses after one ppo update
         return  {"loss": loss.item(), 
@@ -365,22 +374,18 @@ class MaskGeneratingModelForIMDB(nn.Module):
             # gae = rewards[step] - 0.1* mean_reward - 0.9 * values[step]
             # delta = rewards[step] + gamma * values[step + 1] * masks[step] - values[step]
             # delta = rewards[step] - values[step]
-            # delta = rewards[step] - 0.5 * mean_reward - 0.5 * values[step]
-            # gae = rewards[step] - gamma * mean_reward - (1 - gamma) * values[step]
-            gae = rewards[step] - values[step]
-            # gae = rewards[step] - mean_reward
+            delta = rewards[step] - mean_reward
             # gae = delta + gamma * tau * masks[step] * gae
-            # gae = delta
+            gae = delta
             # print("gae:", gae.mean())
 
-            # returns.insert(0, gae + values[step])
             returns.insert(0, gae + values[step])
         
         return returns
 
 
     @torch.no_grad()
-    def get_action_reward(self, model, state, action, sim_upper, sim_lower):
+    def get_action_reward(self, model, state, action, correct_logprob_upper, correct_logprob_lower, log_probs_upper, log_probs_lower, new_response_mask):
         """ 
         action : mask
         state : pixel_values
@@ -396,8 +401,8 @@ class MaskGeneratingModelForIMDB(nn.Module):
         masked_input_ids[to_be_masked == 1] = self.mask_token_id
 
         # get reward
-        sim = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
-        reward = self.get_reward(sim, sim_upper, sim_lower, action, context_mask, attention_mask, response_mask)
+        sim, correct_logprob, log_probs, _, _ = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
+        reward = self.get_reward(correct_logprob, correct_logprob_upper, correct_logprob_lower, log_probs, log_probs_upper, log_probs_lower, action, context_mask, attention_mask, new_response_mask)
         # print("reward:", reward.mean())
 
         return state, reward
@@ -414,51 +419,45 @@ class MaskGeneratingModelForIMDB(nn.Module):
         shift_response_mask[:, :-1] = shift_response_mask[:, 1:]
         shift_response_mask[:, -1] = 0 # mast be zero.
 
-        sim, correct_logprob = similarity_measure(logits, labels, shift_response_mask)
+        sim, correct_logprob, log_probs, new_response_mask = similarity_measure(logits, labels, shift_response_mask)
         # print('sim_shape_before', sim.shape)
         # sim = sim * response_mask
         # print('sim_shape_after', sim.shape)
 
-        return sim
+        return sim, correct_logprob, log_probs, shift_response_mask, new_response_mask
     
     @torch.no_grad()
-    def get_reward(self, sim, sim_upper, sim_lower, user_input_mask, context_mask, attention_mask, response_mask):
+    def get_reward(self, correct_logprob, correct_logprob_upper, correct_logprob_lower, log_probs, log_probs_upper, log_probs_lower, user_input_mask, context_mask, attention_mask, new_response_mask):
         # reward_raw = torch.exp(sim - sim_upper) - torch.exp(sim_lower - sim_upper)
         # reward_raw = torch.exp(sim)
+        # print("reward_raw:", reward_raw)
         # reward_raw = torch.exp(sim) - torch.exp(sim_lower)
         # reward_scale = torch.exp(sim_upper - sim_lower)
         # print("reward_raw:", reward_raw.mean())
-        # num_attent_non_context_tokens = attention_mask.sum(-1) - context_mask.sum(-1) - response_mask.sum(-1)
+        factor = ((user_input_mask * context_mask).sum(-1)) / context_mask.sum(-1)
+        num_attent_non_context_tokens = attention_mask.sum(-1) - context_mask.sum(-1) - new_response_mask.sum(-1)
         # factor = ((user_input_mask * context_mask).sum(-1) + num_attent_non_context_tokens) / (context_mask.sum(-1) + num_attent_non_context_tokens)
         # inverse_factor = torch.where(factor <= 0.2, torch.ones_like(factor), 1 / factor)
-        # inverse_factor = 1 / factor
-        # factor = ((user_input_mask * context_mask).sum(-1) + num_attent_non_context_tokens)
-        # reward_raw = torch.exp(sim / factor) 
-
-        # limitor = torch.where(factor >= 0.5, torch.zeros_like(factor), 1)
-
-        # reward = torch.where(reward_raw < 0.1, torch.zeros_like(reward_raw), reward_raw)
-        factor = ((user_input_mask * context_mask).sum(-1)) / context_mask.sum(-1)
-        # num_attent_non_context_tokens = attention_mask.sum(-1) - context_mask.sum(-1) - response_mask.sum(-1)
-        # factor = ((user_input_mask * context_mask).sum(-1) + num_attent_non_context_tokens) / (context_mask.sum(-1) + num_attent_non_context_tokens)
-        # inverse_factor = torch.where(factor <= 0.2, torch.full_like(factor,5), 1 / factor)
-
         # inverse_factor = torch.where(reward_raw < 0.1, torch.zeros_like(factor), 1 / factor)
-        inverse_factor = 1 / (factor+1e-2)
+        inverse_factor = 1 / factor
+        comp_factor = 1 - factor
         # reward_raw = torch.exp(sim / ((user_input_mask * context_mask).sum(-1) + num_attent_non_context_tokens))
-        # reward_raw = torch.exp(sim / )
-        reward_raw = torch.exp(sim ) - torch.exp(sim_lower)
 
+        distance = ((correct_logprob.exp() ) * new_response_mask).sum(-1) / new_response_mask.sum(-1)
+        kl_div = (F.kl_div(log_probs, log_probs_upper.exp(), reduction='mean') * new_response_mask).sum(-1) / new_response_mask.sum(-1)
 
-        # limitor = torch.where(factor >= 0.5, torch.zeros_like(factor), 1)
+        reward_raw = distance #* inverse_factor
+        reward = distance - kl_div + comp_factor
+        # distance = (distance + 0.5*comp_factor.unsqueeze(-1)) * response_mask
+        # reward_raw = distance.sum(-1) / response_mask.sum(-1)
+        # reward = distance.sum(-1) / response_mask.sum(-1)
+        # distance = torch.where(distance < 0.5, torch.zeros_like(distance), distance * inverse_factor.unsqueeze(-1))
 
-        # reward = torch.where(reward_raw < 0.1, torch.zeros_like(reward_raw), reward_raw)
-        reward = reward_raw * inverse_factor
-        # reward = reward - factor
-        # reward = reward * (1 / (factor**2 + 1e-5))
+        # print("distance:", distance[0])
+
         # print("reward:", reward.shape)
         # print("sim:", sim.mean(), "sim_upper:", sim_upper.mean(), "sim_lower:", sim_lower.mean())
-        # print("reward:", reward.mean(), "factor:", factor.mean())
+        print("reward_raw:", reward_raw.mean(), "reward:", reward.mean(), "factor:", factor.mean())
 
         return reward
 
@@ -476,22 +475,22 @@ class MaskGeneratingModelForIMDB(nn.Module):
 
 
         state = input_ids, attention_mask, context_mask, response_mask
-        sim_upper = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
+        sim_upper, correct_logprob_upper, log_probs_upper, _, _ = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
 
         to_be_masked = context_mask
         masked_input_ids = input_ids.clone()
         masked_input_ids[to_be_masked == 1] = self.mask_token_id
-        sim_lower = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
+        sim_lower, correct_logprob_lower, log_probs_lower, shift_response_mask, new_response_mask  = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
     
         with torch.no_grad():
             for step in range(num_steps):
                 dist, value = self.get_dist_critic(model, state)
                 action = dist.sample()
                 action = action * context_mask
-                next_state, reward = self.get_action_reward(model, state, action, sim_upper, sim_lower)
+                next_state, reward = self.get_action_reward(model, state, action, correct_logprob_upper, correct_logprob_lower, log_probs_upper, log_probs_lower, new_response_mask)
 
                 # log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-                log_prob = (dist.log_prob(action) * context_mask).sum(-1) #/ context_mask.sum(-1) # (N,)
+                log_prob = (dist.log_prob(action) * context_mask).sum(-1) / context_mask.sum(-1) # (N,)
                 # log_prob = dist.log_prob(action) # (N, L)
                 entropy += (dist.entropy()* context_mask).sum(-1) / context_mask.sum(-1)
 
@@ -547,6 +546,36 @@ class MaskGeneratingModelForIMDB(nn.Module):
 
         loss_dict = self.ppo_update(model, optimizer, ppo_epochs, mini_batch_size, states, actions, log_probs, returns, advantages, labels)
         return loss_dict
+    
+    def progressive_insertion_action(self, model, input_ids, attention_mask, context_mask, response_mask, num_steps=20):
+        sim_upper, correct_logprob_upper, log_probs_upper, _, _ = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
+
+        to_be_masked = context_mask
+        masked_input_ids = input_ids.clone()
+        masked_input_ids[to_be_masked == 1] = self.mask_token_id
+        sim_lower, correct_logprob_lower, log_probs_lower, shift_response_mask, new_response_mask = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
+        rewards   = []
+
+        state = input_ids, attention_mask, context_mask, response_mask
+    
+        with torch.no_grad():
+            for step in range(num_steps):
+                mask_ratio = (step + 1) / num_steps # linearly increase the mask ratio
+                dist, value = self.get_dist_critic(model, state)
+                action = dist.sample()
+                # modify the action
+                action_prob = torch.full_like(action, mask_ratio)
+                action = torch.bernoulli(action_prob)
+                action = action * context_mask
+                next_state, reward = self.get_action_reward(model, state, action, correct_logprob_upper, correct_logprob_lower, log_probs_upper, log_probs_lower, new_response_mask)
+
+                # log_prob = dist.log_prob(action).sum(-1, keepdim=True)
+                log_prob = (dist.log_prob(action) * context_mask).sum(-1) #/ context_mask.sum(-1) # (N,)
+
+
+                state = next_state  
+                rewards.append(reward.unsqueeze(-1))
+        return torch.cat(rewards, dim=-1)
 
 
 
