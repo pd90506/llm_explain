@@ -37,7 +37,7 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 
 # TODO 注意load正确的模型
-from llmexp.imdb_model import MaskGeneratingModelForIMDB
+from llmexp.next_token_model import MaskGeneratingModelForIMDB
 from tqdm import tqdm
 
 
