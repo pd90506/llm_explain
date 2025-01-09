@@ -8,6 +8,10 @@ other worthnoting changes
 import torch.nn as nn 
 import torch.nn.functional as F
 import torch
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
+
+from torch.cuda.amp import autocast, GradScaler
+scaler = GradScaler()
 
 
 def similarity_measure(logits, labels):
@@ -72,6 +76,7 @@ class Environment:
         Applies the action (mask) on the current state.
         """
         input_ids, attention_mask, context_mask = self.state
+        # get the mask for the last token
         mask = action
 
         # To be masked tokens are those in the context and also masked by the agent
@@ -105,7 +110,9 @@ class Environment:
         new_state = self.action_on_state(action)
         masked_input_ids, attention_mask, context_mask = new_state
         log_prob_predictions, log_probs = self.calculate_sim(masked_input_ids, attention_mask, labels=masked_input_ids)
-        reward = torch.exp(log_prob_predictions)
+        reward = torch.exp(log_prob_predictions) * context_mask.sum(-1) / (1 + (action * context_mask).sum(-1))  # [batch_size]
+        # reward = torch.exp(log_prob_predictions)  # [batch_size]
+        # print("reward", reward.mean())
         return reward
 
 
@@ -114,14 +121,28 @@ class AutoregressivePredictor(nn.Module):
         super(AutoregressivePredictor, self).__init__()
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
+
+        self.reduce_map = nn.Sequential(
+            nn.Linear(hidden_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, hidden_size),
+        )
+        self.linear = nn.Linear(hidden_size, hidden_size)
         
         # Linear layer to project hidden state to vocabulary logits (tied to embedding layer)
         if embedding_layer is not None:
-            self.output_layer = nn.Linear(hidden_size, vocab_size)
-            self.output_layer.weight = embedding_layer.weight.t()  # Tie weights
-            self.output_layer.weight.requires_grad = False  # Freeze weights
+            self.output_layer = nn.Linear(hidden_size, vocab_size, bias=False)
+            self.output_layer.weight = embedding_layer.weight
+            self.output_layer.weight.requires_grad = False
         else:
             self.output_layer = nn.Linear(hidden_size, vocab_size)
+        
+        # self.norm = nn.LayerNorm(hidden_size)
+        self.norm = LlamaRMSNorm(hidden_size, eps=1e-6)
 
     def forward(self, hidden_state):
         """
@@ -138,15 +159,27 @@ class AutoregressivePredictor(nn.Module):
         N, L, d = hidden_state.shape
 
         # Split hidden_state into previous tokens and the last token
+        hidden_state = self.reduce_map(hidden_state)  # [N, L, d]
         previous_tokens = hidden_state[:, :-1, :]  # [N, L-1, d]
         last_token = hidden_state[:, -1, :]  # [N, d]
 
         # Compute the dot product (KQ similarity) between each of the previous tokens and the last token
-        similarity_scores = torch.bmm(previous_tokens, last_token.unsqueeze(-1)).squeeze(-1)  # [N, L-1]
+        # similarity_scores = torch.bmm(previous_tokens, last_token.unsqueeze(-1)).squeeze(-1)  # [N, L-1]
+        similarity_vector = torch.einsum("nld,nd->nld", previous_tokens, last_token)  # [N, L-1, d]
+        # similarity_vector = previous_tokens
+        # similarity_vector = self.linear(similarity_vector)  # [N, L-1, d]
+        # TODO: 改成 self-attention
+        similarity_vector = self.norm(similarity_vector)  # [N, L-1, d]
+        # print("similarity_vector", similarity_vector[:1])
 
         # Project to vocabulary size for each previous token
-        logits = self.output_layer(previous_tokens)  # [N, L-1, vocab_size]
-        
+        logits = self.output_layer(similarity_vector)  # [N, L-1, vocab_size]
+        # # 注册钩子函数来清除 logits 的梯度
+        # def zero_grad_hook(grad):
+        #     return grad * 0  # 设置梯度为0，避免更新 output_layer 的权重
+
+        # logits.register_hook(zero_grad_hook)
+
         # Expand to match expected output shape [N, L, vocab_size] with the last token masked
         final_predictions = torch.zeros(N, L, self.vocab_size, device=hidden_state.device)
         final_predictions[:, :-1, :] = logits
@@ -182,9 +215,12 @@ class MaskGenModelForNextToken(nn.Module):
         # Obtain value estimates
         value_hidden_states = self.get_pooled_feature(hidden_states)  # [N, hidden_size]
         value = self.value_map(value_hidden_states).squeeze(-1)  # [N]
+        # print("value", value[:1])
 
         # Generate predictions using autoregressive predictor
         predictions = self.autoregressive_predictor(hidden_states)  # [N, L, vocab_size]
+
+        # print("predictions", predictions[:1])
 
         return predictions, value  # [N, L, vocab_size], [N]
 
@@ -204,50 +240,125 @@ class MaskGenModelForNextToken(nn.Module):
         state: The input state, consisting of input_ids, attention_mask, context_mask
         """
         input_ids, attention_mask, context_mask = state
+        last_token = input_ids[:, -1:]  # [N, 1]
         # Extract features from the model
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
-            last_hidden_state = outputs.hidden_states[-1].float()  # [N, L, hidden_size]
+            last_hidden_state = outputs.hidden_states[-1]  # [N, L, hidden_size]
         
         predictions, value = self.forward(last_hidden_state, attention_mask, context_mask)
-        inferred_state = last_hidden_state, attention_mask, context_mask
+        predictions = torch.softmax(predictions, -1)  # [N, L, vocab_size]
+        # predictions = torch.gather(predictions, dim=-1, index=last_token.unsqueeze(-1)).squeeze(-1)  # [N, L]
+        predictions = torch.gather(predictions, dim=2, index=last_token.unsqueeze(1).expand(-1, predictions.size(1), -1)).squeeze(-1)  # [N, L]
+        inferred_state = last_hidden_state, attention_mask, context_mask, last_token
         
-        dist = torch.distributions.Bernoulli(logits=predictions)  # [N, L]
+        dist = torch.distributions.Bernoulli(probs=predictions)  # [N, L]
         return dist, value, inferred_state # [N, L], [N]
 
 
-    def bandit_update(self, optimizer, inferred_states, actions, old_log_probs, advantages, alpha=0.1, clip_param=0.2):
+    def bandit_update(self, optimizer, inferred_states, actions, old_log_probs, rewards, advantages, logits, alpha=0.1, clip_param=0.2, batch_size=16):
         """
-        Perform bandit-style update with advantage estimation and PPO clipping.
+        Perform bandit-style update with advantage estimation and PPO clipping using mini-batch updates.
         Args:
-            model: The Llama3 model to generate the logits.
             optimizer: The optimizer for updating the model parameters.
-            states: Input states consisting of input_ids, attention_mask, and context_mask.
+            inferred_states: Inferred states consisting of input_ids, attention_mask, and context_mask.
             actions: Actions taken by the agent.
+            old_log_probs: Log probabilities of actions from the previous policy.
             advantages: Advantages obtained for each action.
             alpha: Learning rate for the bandit update.
             clip_param: Clipping parameter for PPO update.
+            batch_size: Size of the mini-batches.
         """
-        # Calculate log probabilities for the actions taken
-        # hidden_states # [N*num_steps, L, hidden_size]
-        # attention_mask # [N*num_steps, L]
-        # context_mask # [N*num_steps, L]
-        hidden_states, attention_mask, context_mask = inferred_states
-        dist, _ = self.forward(hidden_states, attention_mask, context_mask)
-        log_probs = dist.log_prob(actions)
-        old_log_probs = old_log_probs.detach()
+        # Split data into mini-batches
+        num_samples = actions.size(0)
 
-        # Calculate ratio for PPO clipping
-        ratio = torch.exp(log_probs - old_log_probs)
-        
-        # Calculate clipped loss
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantages
-        loss = -torch.mean(torch.min(surr1, surr2))
+        total_loss = 0
+        total_ratio = 0
+        total_advantages = 0
+        num_updates = 0
+        total_entropy = 0
+        total_kl_div = 0
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Iterate through mini-batches
+        for _ in range(num_samples // batch_size):
+            # Randomly sample mini-batch indices
+            batch_indices = torch.randint(0, num_samples, (batch_size,))
+            
+            # Select mini-batch data
+            mini_hidden_states = inferred_states[0][batch_indices]
+            mini_attention_mask = inferred_states[1][batch_indices]
+            mini_context_mask = inferred_states[2][batch_indices]
+            mini_last_token = inferred_states[3][batch_indices]
+            mini_actions = actions[batch_indices]
+            mini_old_log_probs = old_log_probs[batch_indices]
+            mini_advantages = advantages[batch_indices]
+            mini_logits = logits[batch_indices]
+            mini_rewards = rewards[batch_indices]
+
+            # Calculate log probabilities for the actions taken
+            mu_logits, value = self.forward(mini_hidden_states, mini_attention_mask, mini_context_mask)
+            mu_probs = torch.softmax(mu_logits, -1)
+
+            dist_probs = torch.gather(mu_probs, dim=2, index=mini_last_token.unsqueeze(1).expand(-1, mu_probs.size(1), -1)).squeeze(-1)  # [batch_size, L]
+            dist = torch.distributions.Bernoulli(probs=dist_probs)  # [batch_size, L]
+            # print("last token", mini_last_token[:3])
+            # print("dist_probs", dist_probs[:3])
+            # print("mini_actions", mini_actions[:3])
+            log_probs = dist.log_prob(mini_actions)
+
+            # Entropy of the distribution
+            entropy = dist.entropy().mean()
+
+            # Calculate KL divergence between the mu_logits and the predicted logits
+            logits_expanded = mini_logits.unsqueeze(1).expand_as(mu_logits) # [batch_size, L, vocab_size]
+            mu_logits_softmax = torch.log_softmax(mu_logits, -1) # [batch_size, L, vocab_size]
+            logit_expand_softmax = torch.softmax(logits_expanded, -1) # [batch_size, L, vocab_size]
+            # kl_div = F.kl_div(mu_logits_softmax, logit_expand_softmax, reduction='batchmean') # [batch_size, L]
+            kl_div = (kl_div.sum(-1) * mini_context_mask).sum(-1) / mini_context_mask.sum(-1) # [batch_size, L]
+            kl_div = kl_div.mean()
+            
+            mask_loss = dist_probs.mean()
+            
+            # Calculate ratio for PPO clipping
+            ratio = torch.exp(log_probs.sum(-1) - mini_old_log_probs.sum(-1))  # [batch_size]
+            print("logprob", log_probs.mean())
+            # print("old_log_probs", mini_old_log_probs.mean())
+            # print("ratio", ratio.mean())
+
+            # Calculate clipped loss
+            surr1 = ratio * mini_advantages
+            surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * mini_advantages
+            actor_loss = -torch.mean(torch.min(surr1, surr2))
+
+            # Claculate critic loss
+            # critic_loss = F.mse_loss(mini_rewards, value)
+            critic_loss = (mini_rewards - value).pow(2).mean()
+
+            loss = 0.5 * critic_loss +  actor_loss - 0.01 * entropy + 1 * kl_div
+
+            # Perform gradient step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Aggregate losses and metrics
+            total_loss += loss.item()
+            total_ratio += ratio.mean().item()
+            total_advantages += mini_advantages.mean().item()
+            total_entropy += entropy.item()
+            total_kl_div += kl_div.item()
+            num_updates += 1
+
+        # Return average metrics over all mini-batches
+        return {
+            "loss": total_loss / num_updates,
+            "advantages": total_advantages / num_updates,
+            "ratio": total_ratio / num_updates,
+            "entropy": total_entropy / num_updates,
+            "kl_div": total_kl_div / num_updates,
+            "mask_loss": mask_loss.item()
+        }
+
 
 
     def train_one_batch(self, model, input_ids, attention_mask, context_mask, optimizer, 
@@ -266,233 +377,53 @@ class MaskGenModelForNextToken(nn.Module):
         rewards = []
         log_probs = []
         inferred_states = []
+        logits = []
+        values = []
+        advantages = []
 
+        with torch.no_grad():
+            # Set initial state
+            state = input_ids, attention_mask, context_mask
+            environment.set_state(state)
+            dist, value, inferred_state = self.get_dist_critic(model, state)
+            logit = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True).logits[:, -1, :]  # [N, vocab_size]
 
-        # Set initial state
-        state = input_ids, attention_mask, context_mask
-        environment.set_state(state)
-        dist, _, inferred_state = self.get_dist_critic(model, state)
-        
-        
-        for _ in range(num_steps):
-            action = dist.sample() # [N, L]
-            log_prob = dist.log_prob(actions) # [N, L]
-            # State does not change during step
-            reward = environment.get_reward(action, state) # [N]
+            
+            for _ in range(num_steps):
+                action = dist.sample() # [N, L]
+                
+                log_prob = dist.log_prob(action) # [N, L]
+                # State does not change during step
+                reward = environment.get_reward(action, state) # [N]
 
-            states.append(state)
-            actions.append(action)
-            rewards.append(reward)
-            log_probs.append(log_prob)
-            inferred_states.append(inferred_state)
-        
-        # Get mean reward as value estimate 
-        value = torch.stack(rewards).mean(dim=0) # [N]
-        advantage = [r - value for r in rewards] # num_steps * [N]
+                states.append(state)
+                actions.append(action)
+                rewards.append(reward)
+                log_probs.append(log_prob)
+                inferred_states.append(inferred_state)
+                logits.append(logit.clone())
+                advantages.append(reward - value)
+                values.append(value)
+            
+            # Get mean reward as value estimate 
+            value = torch.stack(rewards).mean(dim=0) # [N]
+            # advantage = [r - value for r in rewards] # num_steps * [N]
+            # advantage = rewards
 
-        # Convert lists to tensors
-        advantages = torch.stack(advantage) # [N*num_steps,]
-        actions = torch.cat(actions) # [N*num_steps, L]
-        states = [torch.cat([s[i] for s in states]) for i in range(len(states[0]))]
-        inferred_states = [torch.cat([s[i] for s in inferred_states]) for i in range(len(inferred_states[0]))]
-        log_probs = torch.cat(log_probs) # [N*num_steps, L]
+            # Convert lists to tensors
+            advantages = torch.cat(advantages) # [N*num_steps,]
+            actions = torch.cat(actions) # [N*num_steps, L]
+            states = [torch.cat([s[i] for s in states]) for i in range(len(states[0]))]
+            inferred_states = [torch.cat([s[i] for s in inferred_states]) for i in range(len(inferred_states[0]))]
+            log_probs = torch.cat(log_probs) # [N*num_steps, L]
+            logits = torch.cat(logits) # [N*num_steps, vocab_size]
+
+            rewards = torch.cat(rewards)
+
+            
 
         # Perform bandit-style update with advantage estimation and PPO clipping
-        self.bandit_update(model, optimizer, inferred_states, actions, log_probs, advantages, alpha)
-
-
-    # @torch.no_grad()
-    # def compute_gae(self, next_value, rewards, masks, values, gamma=0.99, tau=0.95):
-    #     """
-    #     Computes the Generalized Advantage Estimation (GAE) for the given rewards, masks, values, and next value.
-    #     Parameters:
-    #     - next_value (Tensor): The value of the next state.
-    #     - rewards (Tensor): The rewards received.
-    #     - masks (Tensor): The masks of the environment.
-    #     - values (Tensor): The value estimates.
-    #     - gamma (float, optional): The discount factor. Defaults to 0.99.
-    #     - tau (float, optional): The GAE parameter. Defaults to 0.95.
-    #     Returns:
-    #     - list: List of GAE-estimated returns for each step.
-    #     """
-    #     values = values + [next_value]
-    #     gae = 0
-    #     sum_gae=0
-    #     returns = []
-    #     mean_reward = sum(rewards) / len(rewards)
-    #     # print("mean_reward:", mean_reward.shape)
-    #     # mean_reward = rewards.mean(dim=-1)
-    #     # print("reward in gae:", rewards[0].shape)
-    #     for idx, step in enumerate(reversed(range(len(rewards)))):  
-    #         # gae = rewards[step] - values[step]
-    #         # gae = rewards[step] - 0.1* mean_reward - 0.9 * values[step]
-    #         # delta = rewards[step] + gamma * values[step + 1] * masks[step] - values[step]
-    #         # delta = rewards[step] - values[step]
-    #         # delta = rewards[step] - 0.5 * mean_reward - 0.5 * values[step]
-    #         # gae = rewards[step] - gamma * mean_reward - (1 - gamma) * values[step]
-    #         gae = rewards[step] - values[step]
-    #         # gae = rewards[step] - mean_reward
-    #         # gae = delta + gamma * tau * masks[step] * gae
-    #         # gae = delta
-    #         # print("gae:", gae.mean())
-
-    #         # returns.insert(0, gae + values[step])
-    #         returns.insert(0, gae + values[step])
-        
-    #     return returns
-
-
-    # @torch.no_grad()
-    # def get_action_reward(self, model, state, action, correct_logprob_upper, correct_logprob_lower, new_response_mask):
-    #     """ 
-    #     action : mask
-    #     state : pixel_values
-    #     """
-    #     mask = action
-    #     input_ids, attention_mask, context_mask, response_mask = state
-
-    #     # mask = (context_mask * mask + (1. - context_mask)) # do not mask the context tokens for prompting
-    #     # masked_attention_mask = attention_mask * mask
-    #     to_be_masked = (1 - mask) * context_mask
-
-    #     masked_input_ids = input_ids.clone()
-    #     masked_input_ids[to_be_masked == 1] = self.mask_token_id
-
-    #     # get reward
-    #     sim, correct_logprob, _, _ = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
-    #     reward = self.get_reward(correct_logprob, correct_logprob_upper, correct_logprob_lower, action, context_mask, attention_mask, new_response_mask)
-    #     # print("reward:", reward.mean())
-
-    #     return state, reward
-
-    # @torch.no_grad()
-    # def calculate_sim(self, model, input_ids, attention_mask, response_mask, labels):
-    #     outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-    #     logits = outputs.logits.float()
-    #     # shift labels and response_mask to the left by one to match the next token prediction format
-    #     labels = labels.clone()
-    #     labels[:, :-1] = labels[:, 1:]
-    #     labels[:, -1] = -100 # a random value that will be masked by the shift_response_mask
-    #     shift_response_mask = response_mask.clone()
-    #     shift_response_mask[:, :-1] = shift_response_mask[:, 1:]
-    #     shift_response_mask[:, -1] = 0 # mast be zero.
-
-    #     sim, correct_logprob, new_response_mask = similarity_measure(logits, labels, shift_response_mask)
-    #     # print('sim_shape_before', sim.shape)
-    #     # sim = sim * response_mask
-    #     # print('sim_shape_after', sim.shape)
-
-    #     return sim, correct_logprob, shift_response_mask, new_response_mask
-    
-    # @torch.no_grad()
-    # def get_reward(self, correct_logprob, correct_logprob_upper, correct_logprob_lower, user_input_mask, context_mask, attention_mask, new_response_mask):
-    #     # reward_raw = torch.exp(sim - sim_upper) - torch.exp(sim_lower - sim_upper)
-    #     # reward_raw = torch.exp(sim)
-    #     # print("reward_raw:", reward_raw)
-    #     # reward_raw = torch.exp(sim) - torch.exp(sim_lower)
-    #     # reward_scale = torch.exp(sim_upper - sim_lower)
-    #     # print("reward_raw:", reward_raw.mean())
-    #     factor = ((user_input_mask * context_mask).sum(-1)) / context_mask.sum(-1)
-    #     num_attent_non_context_tokens = attention_mask.sum(-1) - context_mask.sum(-1) - new_response_mask.sum(-1)
-    #     # factor = ((user_input_mask * context_mask).sum(-1) + num_attent_non_context_tokens) / (context_mask.sum(-1) + num_attent_non_context_tokens)
-    #     # inverse_factor = torch.where(factor <= 0.2, torch.ones_like(factor), 1 / factor)
-    #     # inverse_factor = torch.where(reward_raw < 0.1, torch.zeros_like(factor), 1 / factor)
-    #     inverse_factor = 1 / factor
-    #     comp_factor = 1 - factor
-    #     # reward_raw = torch.exp(sim / ((user_input_mask * context_mask).sum(-1) + num_attent_non_context_tokens))
-
-    #     distance = ((correct_logprob.exp() ) * new_response_mask).sum(-1) / new_response_mask.sum(-1)
-    #     reward_raw = distance #* inverse_factor
-    #     reward = distance + comp_factor
-    #     # distance = (distance + 0.5*comp_factor.unsqueeze(-1)) * response_mask
-    #     # reward_raw = distance.sum(-1) / response_mask.sum(-1)
-    #     # reward = distance.sum(-1) / response_mask.sum(-1)
-    #     # distance = torch.where(distance < 0.5, torch.zeros_like(distance), distance * inverse_factor.unsqueeze(-1))
-
-    #     # print("distance:", distance[0])
-
-    #     # print("reward:", reward.shape)
-    #     # print("sim:", sim.mean(), "sim_upper:", sim_upper.mean(), "sim_lower:", sim_lower.mean())
-    #     print("reward_raw:", reward_raw.mean(), "reward:", reward.mean(), "factor:", factor.mean())
-
-    #     return reward
-
-    # def train_one_batch(self, model, input_ids, attention_mask, context_mask, response_mask,
-    #                     optimizer: torch.optim.Optimizer, num_steps=20, mini_batch_size=32, ppo_epochs=10):
-    #     self.train() 
-    #     log_probs = []
-    #     values    = []
-    #     states    =  {"input_ids":[], "attention_mask":[], "context_mask":[], "response_mask":[]}
-    #     actions   = []
-    #     rewards   = []
-    #     masks     = []
-    #     entropy = 0
-    #     # labels = [] 
-
-
-    #     state = input_ids, attention_mask, context_mask, response_mask
-    #     sim_upper, correct_logprob_upper, _, _ = self.calculate_sim(model, input_ids, attention_mask, response_mask, labels=input_ids)
-
-    #     to_be_masked = context_mask
-    #     masked_input_ids = input_ids.clone()
-    #     masked_input_ids[to_be_masked == 1] = self.mask_token_id
-    #     sim_lower, correct_logprob_lower, shift_response_mask, new_response_mask  = self.calculate_sim(model, masked_input_ids, attention_mask, response_mask, labels=input_ids)
-    
-    #     with torch.no_grad():
-    #         for step in range(num_steps):
-    #             dist, value = self.get_dist_critic(model, state)
-    #             action = dist.sample()
-    #             action = action * context_mask
-    #             next_state, reward = self.get_action_reward(model, state, action, correct_logprob_upper, correct_logprob_lower, new_response_mask)
-
-    #             # log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-    #             log_prob = (dist.log_prob(action) * context_mask).sum(-1) #/ context_mask.sum(-1) # (N,)
-    #             # log_prob = dist.log_prob(action) # (N, L)
-    #             entropy += (dist.entropy()* context_mask).sum(-1) / context_mask.sum(-1)
-
-    #             log_probs.append(log_prob.unsqueeze(-1))
-    #             values.append(value.unsqueeze(-1))
-    #             rewards.append(reward.unsqueeze(-1))
-    #             if step == num_steps - 1:
-    #                 masks.append(torch.zeros_like(reward).unsqueeze(-1))
-    #             else:
-    #                 masks.append(torch.ones_like(reward).unsqueeze(-1))
-                
-    #             states["input_ids"].append(input_ids)
-    #             states["attention_mask"].append(attention_mask)
-    #             states["context_mask"].append(context_mask)
-    #             states["response_mask"].append(response_mask)
-    #             actions.append(action.clone())
-    #             # labels.append(input_ids.clone())
-
-
-    #             state = next_state 
-            
-    #         _, next_value = self.get_dist_critic(model, state)
-            
-    #         returns = self.compute_gae(next_value, rewards, masks, values)
-    #         # returns = self.compute_gae_static_state(next_value, rewards, masks, values)
-    #         returns = torch.cat(returns)
-    #         # returns = returns[0].repeat(len(rewards), 1)
-    #         log_probs = torch.cat(log_probs)
-    #         values    = torch.cat(values)
-    #         actions   = torch.cat(actions)
-    #         labels    = values
-
-    #         states["input_ids"] = torch.cat(states["input_ids"])
-    #         states["attention_mask"] = torch.cat(states["attention_mask"])
-    #         states["context_mask"] = torch.cat(states["context_mask"])
-    #         states["response_mask"] = torch.cat(states["response_mask"])
-    #         # returns = returns[0]
-    #         # log_probs = log_probs[0]
-    #         # values    = values[0]
-    #         # states    = states[0]
-    #         # actions   = actions[0]
-    #         # print("returns.shape:", returns.shape)
-    #         # print("values.shape:", values.shape)
-    #         advantages = returns - values
-
-    #     loss_dict = self.ppo_update(model, optimizer, ppo_epochs, mini_batch_size, states, actions, log_probs, returns, advantages, labels)
-    #     return loss_dict
+        loss_dict = self.bandit_update(optimizer, inferred_states, actions, log_probs, rewards, advantages, logits, alpha)
+        return loss_dict 
 
     

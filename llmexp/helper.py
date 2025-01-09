@@ -66,7 +66,7 @@ class DataHelper():
             text_key='text',
             sys_context=(
                 "You are a chatbot for sentiment analysis. "
-                "You can help users with their questions via concise responses of POSITIVE or NEGATIVE."
+                "You can help users with their questions via single word responses of POSITIVE or NEGATIVE."
             )
         )
 
@@ -76,7 +76,7 @@ class DataHelper():
             text_key='sentence',
             sys_context=(
                 "You are a chatbot for sentiment analysis. "
-                "You can help users with their questions via concise responses of POSITIVE or NEGATIVE."
+                "You can help users with their questions via single word responses of POSITIVE or NEGATIVE."
             )
         )
 
