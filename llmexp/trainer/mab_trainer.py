@@ -84,6 +84,16 @@ class MABTrainer:
         attention_mask = attention_mask[:, :-1] # [batch_size, sequence_length-1]
         cost_value = cost_value / attention_mask.sum(-1).float() # [batch_size]
         return cost_value
+
+    def epsilon_sampling(self, dist: torch.distributions.Distribution, epsilon: float = 0.2):
+        """
+        dist: torch.distributions.Distribution
+        epsilon: float
+        """
+        if torch.rand(1) < epsilon:
+            return torch.bernoulli(torch.full_like(dist.probs, 0.9, device=dist.probs.device))
+        else:
+            return dist.sample()
     
     @torch.no_grad()
     def collect_pulls(self, 
@@ -102,7 +112,7 @@ class MABTrainer:
                             
         # Collect pulls
         for _ in range(num_pulls):
-            pull_mask = dist.sample() # [batch_size, sequence_length-1]
+            pull_mask = self.epsilon_sampling(dist, epsilon=0.2) # [batch_size, sequence_length-1]
             profit = self.get_pull_profit(input_ids, attention_mask, pull_mask, cost_value).unsqueeze(-1) # [batch_size, 1]
             log_prob = dist.log_prob(pull_mask).sum(-1, keepdim=True) # [batch_size, 1]
             
@@ -145,7 +155,32 @@ class MABTrainer:
         # running_mab_value = mab_value_estimation
         profit_value_estimation = profits.mean(dim=1) # [batch_size, 1]
 
-        return running_mab_value, profit_value_estimation, profits # [batch_size, sequence_length-1], [batch_size, 1]
+        return running_mab_value, profit_value_estimation # [batch_size, sequence_length-1], [batch_size, 1]
+
+
+    def get_mab_profit_loss(self, dist: torch.distributions.Distribution, value: torch.Tensor, pull_masks_list: list[torch.Tensor], profits_list: list[torch.Tensor]):
+        """ 
+        dist: torch.distributions.Distribution
+        value: [batch_size, 1]
+        pull_masks_list: list of [batch_size, sequence_length-1]
+        profits_list: list of [batch_size, 1]
+        """
+
+        curr_loss = 0
+
+        for pull_masks, profits in zip(pull_masks_list, profits_list):
+            log_prob = dist.log_prob(pull_masks).sum(-1, keepdim=True) # [batch_size, 1]
+            profit = profits.unsqueeze(-1) # [batch_size, 1]
+            advantage = profit - value.clone().detach() # [batch_size, 1]
+            loss = - (advantage * log_prob).mean()
+            curr_loss += loss
+        
+        profits = torch.stack(profits_list, dim=1) # [batch_size, num_pulls, 1] 
+        mse_loss = F.mse_loss(profits.mean(dim=1), value)
+        
+
+
+        return curr_loss, mse_loss
 
 
 
@@ -165,24 +200,19 @@ class MABTrainer:
             input_ids = random_cut_generated_outputs['input_ids'].to(self.device)
             attention_mask = random_cut_generated_outputs['attention_mask'].to(self.device)
 
-            dist, mab_values, profit_value = self.mab_model.get_dist_value(input_ids, attention_mask)
+            dist, value = self.mab_model.get_dist_value(input_ids, attention_mask)
 
             pulls = self.collect_pulls(input_ids, attention_mask, dist, num_pulls)
             pull_masks_list = pulls['pull_masks_list']
             profits_list = pulls['profits_list']
-            profit_value = profit_value.unsqueeze(-1) # [batch_size, 1]
-            running_mab_value, profit_value_estimation, profit_advantage = self.get_mab_empirical_profit(mab_values=mab_values.clone().detach(), 
-                                                                  profit_value=profit_value.clone().detach(),
-                                                                  pull_masks_list=pull_masks_list, 
-                                                                  profits_list=profits_list, 
-                                                                  gamma=gamma) # [batch_size, sequence_length-1], [batch_size, 1]
-
-            mab_value_loss = self.loss_fn(mab_values, running_mab_value.clone().detach())
+            surr_loss, mse_loss = self.get_mab_profit_loss(dist, value, pull_masks_list, profits_list)
+            # mab_value_loss = self.loss_fn(mab_values, running_mab_value.clone().detach())
             # mab_value_loss = self.bce_loss(mab_values, torch.sigmoid(running_mab_value.clone().detach()))
-            profit_value_loss = self.loss_fn(profit_value, profit_value_estimation.clone().detach())
+            # profit_value_loss = self.loss_fn(profit_value, profit_value_estimation.clone().detach())
             entropy = dist.entropy().mean()
             
-            loss = mab_value_loss + 0.5 * profit_value_loss - 0.00001 *entropy
+            # loss = mab_value_loss - 0.00001 *entropy
+            loss = surr_loss + 0.5 * mse_loss - 0.01 * entropy
 
             # Update the MAB model
             self.optimizer.zero_grad()
@@ -195,17 +225,13 @@ class MABTrainer:
             mask_ratio = pull_masks.mean().item()
             
             wandb.log({
-                'mab_value_loss': mab_value_loss.item(),
+                'surr_loss': surr_loss.item(),
+                'mse_loss': mse_loss.item(),
                 'entropy': entropy.item(),
                 'loss': loss.item(),
-                "profit_value_loss": profit_value_loss.item(),
-                'running_mab_value': running_mab_value.mean().item(),
-                'mab_values': mab_values.mean().item(),
                 'profits': profits.mean().item(),
-                'profit_advantage': profit_advantage.mean().item(),
+                'value': value.mean().item(),
                 'mask_ratio': mask_ratio,
-                'scale': self.mab_model.log_scale.exp().item(),
-                'profit_value': profit_value.mean().item(),
             })
 
             # save the model

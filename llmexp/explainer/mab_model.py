@@ -38,17 +38,17 @@ class MABModel(nn.Module):
             nn.Linear(hidden_size, hidden_size), # output a vector of length hidden_size for the last token
         )
 
-        self.profit_critic = nn.Sequential(
+        self.critic = nn.Sequential(
             nn.Linear(self.base_model.hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, 1), # output a scalar for the expected profit value
+            nn.Linear(hidden_size, 1),
         )
 
         self.actor_head = nn.Linear(hidden_size, 1)
 
-        self.log_scale = nn.Parameter(torch.tensor(0.0))
+        # self.log_scale = nn.Parameter(torch.tensor(0.0))
 
         # Freeze the base model if required
         if freeze_base:
@@ -76,22 +76,23 @@ class MABModel(nn.Module):
 
         # Hadamard product between the generated hidden state and the prompt hidden states
         correlated_hidden_states = generated_hidden_state * prompt_hidden_states # [batch_size, sequence_length-1, hidden_size]
-        mab_values = self.actor_head(correlated_hidden_states).squeeze(-1) # [batch_size, sequence_length-1]
+        logits = self.actor_head(correlated_hidden_states).squeeze(-1) # [batch_size, sequence_length-1]
 
-        profit_value = self.profit_critic(hidden_states[:, -1, :]).squeeze(-1) # [batch_size]
+        value = self.critic(hidden_states[:, -1, :]) # [batch_size, 1]
 
-        return mab_values, profit_value
+        return logits, value
     
     def get_dist_value(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs):
         """
         Get the distribution and the MAB values.
         """
-        mab_values, profit_value = self.forward(input_ids, attention_mask)
-        # l1_prob = F.normalize(torch.exp(self.log_scale) * logits, p=1, dim=-1)
-        l1_prob = scale_to_0_1(mab_values * torch.exp(self.log_scale))
-        dist = torch.distributions.Bernoulli(probs=l1_prob)
+        logits, value = self.forward(input_ids, attention_mask)
+        probs = torch.sigmoid(logits)
+        probs = torch.clamp(probs, 0, 0.9)
 
-        return dist, mab_values, profit_value # 
+        dist = torch.distributions.Bernoulli(probs=probs)
+
+        return dist, value # 
 
     # Public methods that users will commonly use
     def state_dict(self, *args, **kwargs):
