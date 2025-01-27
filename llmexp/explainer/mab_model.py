@@ -39,6 +39,7 @@ class MABModel(nn.Module):
         )
 
         self.actor_head = nn.Linear(hidden_size, 1)
+        self.count_head = nn.Linear(hidden_size, 1)
 
         self.log_scale = nn.Parameter(torch.tensor(0.0))
 
@@ -72,17 +73,19 @@ class MABModel(nn.Module):
 
         profit_value = self.profit_critic(hidden_states[:, -1, :]).squeeze(-1) # [batch_size]
 
-        return logits, profit_value
+        
+        count_values = self.count_head(correlated_hidden_states).squeeze(-1) # [batch_size, sequence_length-1]
+        return logits, profit_value, count_values
     
     def get_dist_value(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs):
         """
         Get the distribution and the MAB values.
         """
-        logits, profit_value = self.forward(input_ids, attention_mask)
-        dist = torch.distributions.Bernoulli(logits=logits)
+        logits, profit_value, count_values = self.forward(input_ids, attention_mask)
+        dist = torch.distributions.Bernoulli(logits=logits+count_values)
         # MAB values are the logits scaled by a constant factor
         mab_values = logits #* torch.exp(self.log_scale)
-        return dist, mab_values, profit_value # 
+        return dist, mab_values, profit_value, count_values # 
 
     # Public methods that users will commonly use
     def state_dict(self, *args, **kwargs):

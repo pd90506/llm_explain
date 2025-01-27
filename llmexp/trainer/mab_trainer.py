@@ -144,7 +144,9 @@ class MABTrainer:
         # running_mab_value = mab_value_estimation
         profit_value_estimation = profits.mean(dim=1) # [batch_size, 1]
 
-        return running_mab_value, profit_value_estimation, profit_advantage # [batch_size, sequence_length-1], [batch_size, 1]
+        count_value_estimation = torch.sqrt(3 * torch.log(torch.tensor(self.num_pulls).to(self.device)) / (2 * (denominator)))
+
+        return running_mab_value, profit_value_estimation, profit_advantage, count_value_estimation # [batch_size, sequence_length-1], [batch_size, 1]
 
 
 
@@ -164,13 +166,13 @@ class MABTrainer:
             input_ids = random_cut_generated_outputs['input_ids'].to(self.device)
             attention_mask = random_cut_generated_outputs['attention_mask'].to(self.device)
 
-            dist, mab_values, profit_value = self.mab_model.get_dist_value(input_ids, attention_mask)
+            dist, mab_values, profit_value, count_values = self.mab_model.get_dist_value(input_ids, attention_mask)
 
             pulls = self.collect_pulls(input_ids, attention_mask, dist, num_pulls)
             pull_masks_list = pulls['pull_masks_list']
             profits_list = pulls['profits_list']
             profit_value = profit_value.unsqueeze(-1) # [batch_size, 1]
-            running_mab_value, profit_value_estimation, profit_advantage = self.get_mab_empirical_profit(mab_values=mab_values.clone().detach(), 
+            running_mab_value, profit_value_estimation, profit_advantage, count_value_estimation = self.get_mab_empirical_profit(mab_values=mab_values.clone().detach(), 
                                                                   profit_value=profit_value.clone().detach(),
                                                                   pull_masks_list=pull_masks_list, 
                                                                   profits_list=profits_list, 
@@ -179,6 +181,7 @@ class MABTrainer:
             mab_value_loss = self.loss_fn(mab_values, running_mab_value.clone().detach())
             # mab_value_loss = self.bce_loss(mab_values, torch.sigmoid(running_mab_value.clone().detach()))
             profit_value_loss = self.loss_fn(profit_value, profit_value_estimation.clone().detach())
+            count_value_loss = self.loss_fn(count_values, count_value_estimation)
             entropy = dist.entropy().mean()
             
             loss = mab_value_loss + 0.5 * profit_value_loss - 0.001 *entropy
