@@ -127,11 +127,12 @@ class MABTrainer:
         pull_masks = torch.stack(pull_masks_list, dim=1) # [batch_size, num_pulls, sequence_length-1]
         profits = torch.stack(profits_list, dim=1) # [batch_size, num_pulls, 1]
 
-        profit_advantage = (profits - profit_value.unsqueeze(1)) # [batch_size, num_pulls, 1]
+        # profit_advantage = (profits - profit_value.unsqueeze(1)) # [batch_size, num_pulls, 1]
 
-        nominator = (pull_masks * profit_advantage).sum(dim=1) # [batch_size, sequence_length-1]
+        # nominator = (pull_masks * profit_advantage).sum(dim=1) # [batch_size, sequence_length-1]
+        nominator = (pull_masks * profits).sum(dim=1) # [batch_size, sequence_length-1]
         # replace the 0s with values in mab_values
-        # nominator = torch.where(nominator == 0, mab_values, nominator)
+        nominator = torch.where(nominator == 0, mab_values, nominator)
 
         denominator = pull_masks.sum(dim=1) # [batch_size, sequence_length-1]
         # replace the 0s with 1s
@@ -144,7 +145,7 @@ class MABTrainer:
         # running_mab_value = mab_value_estimation
         profit_value_estimation = profits.mean(dim=1) # [batch_size, 1]
 
-        return running_mab_value, profit_value_estimation, profit_advantage # [batch_size, sequence_length-1], [batch_size, 1]
+        return running_mab_value, profit_value_estimation, profits # [batch_size, sequence_length-1], [batch_size, 1]
 
 
 
@@ -181,7 +182,7 @@ class MABTrainer:
             profit_value_loss = self.loss_fn(profit_value, profit_value_estimation.clone().detach())
             entropy = dist.entropy().mean()
             
-            loss = mab_value_loss + 0.5 * profit_value_loss - 0.001 *entropy
+            loss = mab_value_loss + 0.5 * profit_value_loss - 0.00001 *entropy
 
             # Update the MAB model
             self.optimizer.zero_grad()

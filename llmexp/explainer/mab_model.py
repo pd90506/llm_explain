@@ -2,6 +2,14 @@ import torch
 import torch.nn as nn 
 import torch.nn.functional as F
 from llmexp.llm.smollm import LLMWrapper
+
+
+def scale_to_0_1(x, dim=-1):
+    x_min = x.min(dim=dim, keepdim=True).values
+    x_max = x.max(dim=dim, keepdim=True).values
+    return (x - x_min) / (x_max - x_min + 1e-8)  # Adding epsilon to avoid division by zero
+
+
 class MABModel(nn.Module):
     """
     Multi-Armed Bandit Model for explanation.
@@ -68,20 +76,21 @@ class MABModel(nn.Module):
 
         # Hadamard product between the generated hidden state and the prompt hidden states
         correlated_hidden_states = generated_hidden_state * prompt_hidden_states # [batch_size, sequence_length-1, hidden_size]
-        logits = self.actor_head(correlated_hidden_states).squeeze(-1) # [batch_size, sequence_length-1]
+        mab_values = self.actor_head(correlated_hidden_states).squeeze(-1) # [batch_size, sequence_length-1]
 
         profit_value = self.profit_critic(hidden_states[:, -1, :]).squeeze(-1) # [batch_size]
 
-        return logits, profit_value
+        return mab_values, profit_value
     
     def get_dist_value(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs):
         """
         Get the distribution and the MAB values.
         """
-        logits, profit_value = self.forward(input_ids, attention_mask)
-        dist = torch.distributions.Bernoulli(logits=logits)
-        # MAB values are the logits scaled by a constant factor
-        mab_values = logits #* torch.exp(self.log_scale)
+        mab_values, profit_value = self.forward(input_ids, attention_mask)
+        # l1_prob = F.normalize(torch.exp(self.log_scale) * logits, p=1, dim=-1)
+        l1_prob = scale_to_0_1(mab_values * torch.exp(self.log_scale))
+        dist = torch.distributions.Bernoulli(probs=l1_prob)
+
         return dist, mab_values, profit_value # 
 
     # Public methods that users will commonly use
