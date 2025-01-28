@@ -30,17 +30,7 @@ class MABModel(nn.Module):
             nn.Linear(hidden_size, hidden_size), # output a vector of length hidden_size for the last token
         )
 
-        self.profit_critic = nn.Sequential(
-            nn.Linear(self.base_model.hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1), # output a scalar for the expected profit value
-        )
-
         self.actor_head = nn.Linear(hidden_size, 1)
-
-        self.log_scale = nn.Parameter(torch.tensor(0.0))
 
         # Freeze the base model if required
         if freeze_base:
@@ -50,12 +40,10 @@ class MABModel(nn.Module):
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs):
         """Forward pass of the Multi-Armed Bandit Model.
 
-        input_ids: 
-                torch.Tensor, shape [batch_size, sequence_length], 
+        input_ids: torch.Tensor, shape [batch_size, sequence_length], 
                 the left padded input_ids with the last token being the generated token
-        attention_mask: 
-                torch.Tensor, shape [batch_size, sequence_length], 
-                the attention_mask, left padded with 0s
+        attention_mask: torch.Tensor, shape [batch_size, sequence_length], 
+                the left padded attention_mask with the last token being the generated token
         """
         
         hidden_states = self.base_model.get_hidden_states(input_ids, attention_mask)
@@ -70,19 +58,14 @@ class MABModel(nn.Module):
         correlated_hidden_states = generated_hidden_state * prompt_hidden_states # [batch_size, sequence_length-1, hidden_size]
         logits = self.actor_head(correlated_hidden_states).squeeze(-1) # [batch_size, sequence_length-1]
 
-        profit_value = self.profit_critic(hidden_states[:, -1, :]).squeeze(-1) # [batch_size]
-
-        return logits, profit_value
+        return logits
     
-    def get_dist_value(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs):
+    def get_logits(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs):
         """
-        Get the distribution and the MAB values.
+        Get the MAB logits
         """
-        logits, profit_value = self.forward(input_ids, attention_mask)
-        dist = torch.distributions.Bernoulli(logits=logits)
-        # MAB values are the logits scaled by a constant factor
-        mab_values = logits #* torch.exp(self.log_scale)
-        return dist, mab_values, profit_value # 
+        logits = self.forward(input_ids, attention_mask)
+        return logits
 
     # Public methods that users will commonly use
     def state_dict(self, *args, **kwargs):

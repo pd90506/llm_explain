@@ -42,15 +42,13 @@ class MABTrainer:
         return logits
 
     def get_pull_profit(self, 
-                          input_ids: torch.Tensor, 
-                          attention_mask: torch.Tensor,
-                          pull_mask: torch.Tensor,
-                          cost_value: torch.Tensor):
+                        input_ids: torch.Tensor, 
+                        attention_mask: torch.Tensor,
+                        pull_mask: torch.Tensor):
         """
         input_ids: [batch_size, sequence_length]
         attention_mask: [batch_size, sequence_length]
         pull_mask: [batch_size, sequence_length-1]
-        cost_value: [batch_size]
         """
         label = input_ids[:, -1] # [batch_size] the last token is the label
         # Get the masked input_ids and attention_mask
@@ -64,44 +62,37 @@ class MABTrainer:
         masked_pred_prob = torch.softmax(logits, -1) # [batch_size, vocab_size]
         masked_true_prob = masked_pred_prob.gather(1, label.unsqueeze(-1)).squeeze(-1) # [batch_size]
 
-        # Get the reward
-        pull_mask = pull_mask * attention_mask[:, :-1] # [batch_size, sequence_length-1]
-        mask_size = pull_mask.sum(-1).float() # [batch_size]
-        profit = masked_true_prob - cost_value * mask_size # [batch_size] 
-
+        profit = masked_true_prob
         return profit
-    
-    def _get_cost_value(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
-        """
-        input_ids: [batch_size, sequence_length]
-        attention_mask: [batch_size, sequence_length]
-        """
-        logits = self.get_second_last_token_logits(input_ids, attention_mask) # [batch_size, vocab_size]
-        probs = torch.softmax(logits, -1) # [batch_size, vocab_size]
-        label = input_ids[:, -1] # [batch_size] the last token is the label
-        cost_value = probs.gather(1, label.unsqueeze(-1)).squeeze(-1) # [batch_size]
-        # ignore the last token
-        attention_mask = attention_mask[:, :-1] # [batch_size, sequence_length-1]
-        cost_value = cost_value / attention_mask.sum(-1).float() # [batch_size]
-        return cost_value
+
     
     @torch.no_grad()
     def collect_pulls(self, 
                       input_ids: torch.Tensor, 
                       attention_mask: torch.Tensor,
-                      dist: torch.distributions.Distribution,
+                      logits: torch.Tensor,
                       num_pulls: int = 3,
                       ) -> dict:
         """Collect pull results for MAB training.
-        
+        input_ids: [batch_size, sequence_length]
+        attention_mask: [batch_size, sequence_length]
+        logits: [batch_size, sequence_length-1]
         """
-        # Initialize lists for PPO
-        log_probs, pull_masks, profits = [], [], []
-        # Get the cost value from the target model
-        cost_value = self._get_cost_value(input_ids, attention_mask) # [batch_size]
+        pull_masks, profits = [], []
+        # change the masked location of logits to -inf or a big negative value
+        logits = logits.masked_fill(attention_mask[:, :-1] == 0, -1e9)
+        # get the probabilities for each valid token
+        probs = torch.softmax(logits, -1) # [batch_size, sequence_length-1]
+        prompt_length = logits.shape[1]
                             
         # Collect pulls
         for _ in range(num_pulls):
+            # sample a random variable K between (0.5, 1)
+            K = 0.5 + 0.5 * torch.rand(1, device=self.device).item()
+            # create a pull mask with the top K probabilities
+            
+            pull_mask = torch.topk(probs, int(K * prompt_length), dim=-1).indices # [batch_size, sequence_length-1]
+
             pull_mask = dist.sample() # [batch_size, sequence_length-1]
             profit = self.get_pull_profit(input_ids, attention_mask, pull_mask, cost_value).unsqueeze(-1) # [batch_size, 1]
             log_prob = dist.log_prob(pull_mask).sum(-1, keepdim=True) # [batch_size, 1]
@@ -127,11 +118,12 @@ class MABTrainer:
         pull_masks = torch.stack(pull_masks_list, dim=1) # [batch_size, num_pulls, sequence_length-1]
         profits = torch.stack(profits_list, dim=1) # [batch_size, num_pulls, 1]
 
-        profit_advantage = (profits - profit_value.unsqueeze(1)) # [batch_size, num_pulls, 1]
+        # profit_advantage = (profits - profit_value.unsqueeze(1)) # [batch_size, num_pulls, 1]
+        profit_advantage = profits
 
         nominator = (pull_masks * profit_advantage).sum(dim=1) # [batch_size, sequence_length-1]
         # replace the 0s with values in mab_values
-        # nominator = torch.where(nominator == 0, mab_values, nominator)
+        nominator = torch.where(nominator == 0, mab_values, nominator)
 
         denominator = pull_masks.sum(dim=1) # [batch_size, sequence_length-1]
         # replace the 0s with 1s
@@ -164,9 +156,10 @@ class MABTrainer:
             input_ids = random_cut_generated_outputs['input_ids'].to(self.device)
             attention_mask = random_cut_generated_outputs['attention_mask'].to(self.device)
 
-            dist, mab_values, profit_value = self.mab_model.get_dist_value(input_ids, attention_mask)
+            # get the logits
+            logits = self.mab_model.get_logits(input_ids, attention_mask)
 
-            pulls = self.collect_pulls(input_ids, attention_mask, dist, num_pulls)
+            pulls = self.collect_pulls(input_ids, attention_mask, logits, num_pulls)
             pull_masks_list = pulls['pull_masks_list']
             profits_list = pulls['profits_list']
             profit_value = profit_value.unsqueeze(-1) # [batch_size, 1]
