@@ -71,6 +71,44 @@ class MABTrainer:
 
         return profit
     
+    def is_pull_correct(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, label: torch.Tensor):
+        """
+        input_ids: [batch_size, sequence_length]
+        attention_mask: [batch_size, sequence_length]
+        label: [batch_size]
+        """
+        pred = self.get_second_last_token_logits(input_ids, attention_mask) # [batch_size, vocab_size]
+        pred = torch.argmax(pred, -1) # [batch_size]
+        correct = (pred == label).float() # [batch_size]
+        return correct
+    
+    def get_pull_profit_acc(self, 
+                          input_ids: torch.Tensor, 
+                          attention_mask: torch.Tensor,
+                          pull_mask: torch.Tensor):
+        """
+        input_ids: [batch_size, sequence_length]
+        attention_mask: [batch_size, sequence_length]
+        pull_mask: [batch_size, sequence_length-1]
+        """
+        # We heed the pull mask to be as small as possible 
+        pull_mask = pull_mask * attention_mask[:, :-1] # [batch_size, sequence_length-1]
+        pull_ratio = pull_mask.sum(-1).float() / attention_mask[:, :-1].sum(-1).float() # [batch_size] 
+
+        # Calculate the token prediction accuracy
+        masked_inputs = get_mab_masked_inputs(input_ids, attention_mask, pull_mask, self.tokenizer)
+        masked_input_ids = masked_inputs['input_ids']
+        masked_attention_mask = masked_inputs['attention_mask']
+
+        # correct = 1 or 0
+        correct = self.is_pull_correct(masked_input_ids, masked_attention_mask, label=input_ids[:, -1]) # [batch_size]
+
+        reward = correct / (pull_ratio + 1e-5) + 0.1 * (1-correct) * pull_ratio # [batch_size]
+
+        profit = reward
+
+        return profit
+    
     def _get_cost_value(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         """
         input_ids: [batch_size, sequence_length]
@@ -112,8 +150,10 @@ class MABTrainer:
                             
         # Collect pulls
         for _ in range(num_pulls):
-            pull_mask = self.epsilon_sampling(dist, epsilon=0.2) # [batch_size, sequence_length-1]
-            profit = self.get_pull_profit(input_ids, attention_mask, pull_mask, cost_value).unsqueeze(-1) # [batch_size, 1]
+            # pull_mask = self.epsilon_sampling(dist, epsilon=0.2) # [batch_size, sequence_length-1]
+            pull_mask = dist.sample() # [batch_size, sequence_length-1]
+            # profit = self.get_pull_profit(input_ids, attention_mask, pull_mask, cost_value).unsqueeze(-1) # [batch_size, 1]
+            profit = self.get_pull_profit_acc(input_ids, attention_mask, pull_mask).unsqueeze(-1) # [batch_size, 1]
             log_prob = dist.log_prob(pull_mask).sum(-1, keepdim=True) # [batch_size, 1]
             
             log_probs.append(log_prob.clone())
@@ -167,15 +207,19 @@ class MABTrainer:
         """
 
         curr_loss = 0
+        profit_tensor = torch.stack(profits_list, dim=1) # [batch_size, num_pulls, 1] 
+        avg_profit = profit_tensor.mean(dim=1) # [batch_size, 1]
 
         for pull_masks, profits in zip(pull_masks_list, profits_list):
             log_prob = dist.log_prob(pull_masks).sum(-1, keepdim=True) # [batch_size, 1]
             profit = profits.unsqueeze(-1) # [batch_size, 1]
-            advantage = profit - value.clone().detach() # [batch_size, 1]
+            # advantage = profit - value.clone().detach() # [batch_size, 1]
+            # advantage = profit - avg_profit # [batch_size, 1]
+            advantage = profit
             loss = - (advantage * log_prob).mean()
             curr_loss += loss
         
-        profits = torch.stack(profits_list, dim=1) # [batch_size, num_pulls, 1] 
+        
         mse_loss = F.mse_loss(profits.mean(dim=1), value)
         
 

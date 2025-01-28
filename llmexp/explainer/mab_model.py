@@ -88,7 +88,6 @@ class MABModel(nn.Module):
         """
         logits, value = self.forward(input_ids, attention_mask)
         probs = torch.sigmoid(logits)
-        probs = torch.clamp(probs, 0, 0.9)
 
         dist = torch.distributions.Bernoulli(probs=probs)
 
