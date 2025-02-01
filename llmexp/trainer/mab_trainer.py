@@ -48,21 +48,26 @@ class MABTrainer:
 
             input_ids = random_cut_generated_outputs['input_ids'].to(self.device)
             attention_mask = random_cut_generated_outputs['attention_mask'].to(self.device)
+            context_mask = random_cut_generated_outputs['context_mask'].to(self.device)
+
+            # get the probability of the correct label
+            label_prob = self.get_pull_prob(input_ids, attention_mask, label=input_ids[:, -1]) # [batch_size, 1]
 
             dist, value = self.mab_model.get_dist_value(input_ids, attention_mask)
 
-            pulls = self.collect_pulls(input_ids, attention_mask, dist, value, num_pulls)
+            pulls = self.collect_pulls(input_ids, attention_mask, context_mask, label_prob, dist, value, num_pulls)
 
             ppo_iterator = self.ppo_iter(self.minibatch_size, pulls)
-            for minibatch in ppo_iterator:
-                ppo_info_dict = self.train_ppo_minibatch(minibatch)
+            for ppo_epoch in range(self.config['ppo_epochs']):
+                for minibatch in ppo_iterator:
+                    ppo_info_dict = self.train_ppo_minibatch(minibatch)
 
             # log 
 
             wandb.log(ppo_info_dict)
 
             # save the model
-            if batch_idx % 100 == 0:
+            if batch_idx % self.config['save_interval'] == 0:
                 torch.save(self.mab_model.state_dict(), f"checkpoints/mab_model_{batch_idx}.pth")
 
 
@@ -70,6 +75,8 @@ class MABTrainer:
     def collect_pulls(self, 
                       input_ids: torch.Tensor, 
                       attention_mask: torch.Tensor,
+                      context_mask: torch.Tensor,
+                      label_prob: torch.Tensor,
                       dist: torch.distributions.Distribution,
                       value: torch.Tensor,
                       num_pulls: int = 3,
@@ -85,8 +92,9 @@ class MABTrainer:
         # Collect pulls
         for _ in range(num_pulls):
             pull_mask = dist.sample() # [batch_size, sequence_length-1]
-            rewards = self.get_pull_reward_acc(input_ids, attention_mask, pull_mask).unsqueeze(-1) # [batch_size, 1]
-            log_prob = dist.log_prob(pull_mask).sum(-1, keepdim=True) # [batch_size, 1]
+            # rewards = self.get_pull_reward_acc(input_ids, attention_mask, context_mask, pull_mask).unsqueeze(-1) # [batch_size, 1]
+            rewards = self.get_pull_reward_prob(input_ids, attention_mask, context_mask, label_prob, pull_mask) # [batch_size, 1]
+            log_prob = self.get_log_probs(dist, context_mask, pull_mask) # [batch_size, 1]
             log_probs_list.append(log_prob.clone())
             rewards_list.append(rewards.clone())
             pull_masks_list.append(pull_mask.clone())
@@ -100,13 +108,17 @@ class MABTrainer:
         pull_masks = torch.cat(pull_masks_list, dim=0) # [batch_size * num_pulls, sequence_length-1]
         input_ids = input_ids.repeat(num_pulls, 1) # [batch_size * num_pulls, sequence_length]
         attention_masks = attention_mask.repeat(num_pulls, 1) # [batch_size * num_pulls, sequence_length]
+        context_masks = context_mask.repeat(num_pulls, 1) # [batch_size * num_pulls, sequence_length]
+        label_probs = label_prob.repeat(num_pulls, 1) # [batch_size * num_pulls, 1]
         return {
             'log_probs': log_probs,
             'pull_masks': pull_masks,
             'input_ids': input_ids,
             'attention_masks': attention_masks,
+            'context_masks': context_masks,
             'rewards': rewards,
             'returns': returns,
+            'label_probs': label_probs,
         }
 
     def compute_returns(self, rewards: list[torch.Tensor], 
@@ -146,45 +158,71 @@ class MABTrainer:
         dist, value = self.mab_model.get_dist_value(minibatch['input_ids'], minibatch['attention_masks'])
 
         pull_masks = minibatch['pull_masks'] # [batch_size, sequence_length-1]
+        context_masks = minibatch['context_masks'] # [batch_size, sequence_length]
+        _context_mask = context_masks[:, :-1] # [batch_size, sequence_length-1]
+
         log_probs = minibatch['log_probs'] # [batch_size, 1]
         returns = minibatch['returns'] # [batch_size, 1]
 
-        actor_loss = self.get_mab_actor_loss(dist, value, pull_masks, returns, log_probs)
+        actor_loss = self.get_mab_actor_loss(dist, value, context_masks, pull_masks, returns, log_probs)
         critic_loss = (returns - value).pow(2).mean()
-        entropy = dist.entropy().mean()
 
-        loss = actor_loss + 0.5 * critic_loss - 0.0001 * entropy
+        entropy = (dist.entropy() * _context_mask.float()).sum(dim=-1, keepdim=True) / _context_mask.sum(dim=-1, keepdim=True) # [batch_size, 1]
+        entropy = entropy.mean()
+
+        mask_ratio = (pull_masks * _context_mask).sum(-1).float() / _context_mask.sum(-1).float() # [batch_size]
+        mask_ratio = mask_ratio.mean()
+
+        # limit dist prob to close to 0.5
+        dist_probs = (dist.probs * _context_mask.float()).sum(-1, keepdim=True) / _context_mask.sum(-1, keepdim=True) # [batch_size, 1]
+        prob_loss = (dist_probs - 0.5).pow(2).mean()
+
+        loss = actor_loss + 0.5 * critic_loss - 0.0001 * entropy + 0.1 * prob_loss
 
         # update the mab model
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        # log 
-        mask_ratio = pull_masks.mean().item()
+
 
         return {
             'loss': loss.item(),
             'actor_loss': actor_loss.item(),
             'critic_loss': critic_loss.item(),
             'entropy': entropy.item(),
-            'mask_ratio': mask_ratio,
+            'mask_ratio': mask_ratio.item(),
             'returns': returns.mean().item(),
             'entropy': entropy.item(),
             'value': value.mean().item(),
         }
 
 
+    def get_log_probs(self, dist: torch.distributions.Distribution, 
+                      context_masks: torch.Tensor,
+                       pull_masks: torch.Tensor):
+        """
+        pull_masks: [batch_size, sequence_length-1]
+        context_masks: [batch_size, sequence_length]
+        """
+        # total log prob 
+        context_masks = context_masks[:, :-1]
+        log_probs = dist.log_prob(pull_masks * context_masks) # [batch_size, sequence_length-1] 
+        total_log_prob = (log_probs * context_masks).sum(-1, keepdim=True) # [batch_size, 1]
+
+        return total_log_prob
 
 
     def get_mab_actor_loss(self, dist: torch.distributions.Distribution, 
                             value: torch.Tensor, 
+                            context_masks: torch.Tensor,
                             pull_masks: torch.Tensor, 
                             returns: torch.Tensor, 
                             log_probs: torch.Tensor):
         """ 
         dist: torch.distributions.Distribution
         value: [batch_size, 1]
+        context_masks: [batch_size, sequence_length]
         pull_masks: [batch_size, sequence_length-1]
         returns: [batch_size, 1]
         log_probs: [batch_size, 1]
@@ -194,7 +232,8 @@ class MABTrainer:
         advantage = returns - value.clone().detach() 
 
         # Calculate the ppo loss 
-        new_log_probs = dist.log_prob(pull_masks).sum(-1, keepdim=True) # [batch_size, 1]
+        new_log_probs = self.get_log_probs(dist, context_masks, pull_masks) # [batch_size, 1]
+        
         old_log_probs = log_probs.clone().detach() # [batch_size, 1]
         ratio = (new_log_probs - old_log_probs).exp()
 
@@ -225,29 +264,81 @@ class MABTrainer:
         correct = (pred == label).float() # [batch_size]
         return correct
     
+    @torch.no_grad()
     def get_pull_reward_acc(self, 
                           input_ids: torch.Tensor, 
                           attention_mask: torch.Tensor,
+                          context_mask: torch.Tensor,
                           pull_mask: torch.Tensor):
         """
         input_ids: [batch_size, sequence_length]
         attention_mask: [batch_size, sequence_length]
+        context_mask: [batch_size, sequence_length]
         pull_mask: [batch_size, sequence_length-1]
         """
         # We heed the pull mask to be as small as possible 
-        pull_mask = pull_mask * attention_mask[:, :-1] # [batch_size, sequence_length-1]
-        pull_ratio = pull_mask.sum(-1).float() / attention_mask[:, :-1].sum(-1).float() # [batch_size] 
-        # num_masked = attention_mask[:, :-1].sum(-1) - pull_mask.sum(-1) # [batch_size]
+        pull_mask = pull_mask * context_mask[:, :-1] # [batch_size, sequence_length-1]
+        pull_ratio = pull_mask.sum(-1).float() / context_mask[:, :-1].sum(-1).float() # [batch_size] 
 
         # Calculate the token prediction accuracy
-        masked_inputs = get_mab_masked_inputs(input_ids, attention_mask, pull_mask, self.tokenizer)
+        masked_inputs = get_mab_masked_inputs(input_ids, attention_mask, context_mask, pull_mask, self.tokenizer)
         masked_input_ids = masked_inputs['input_ids']
         masked_attention_mask = masked_inputs['attention_mask']
 
         # correct = 1 or 0
         correct = self.is_pull_correct(masked_input_ids, masked_attention_mask, label=input_ids[:, -1]) # [batch_size]
 
-        reward =  (1-correct) * pull_ratio # [batch_size]
+        # reward =  (1-correct) * pull_ratio # [batch_size]
+        reward = correct / (pull_ratio+1) # [batch_size]
+
+        return reward
+    
+    @torch.no_grad()
+    def get_pull_prob(self, 
+                      input_ids: torch.Tensor, 
+                      attention_mask: torch.Tensor,
+                      label: torch.Tensor):
+        """
+        input_ids: [batch_size, sequence_length]
+        attention_mask: [batch_size, sequence_length]
+        label: [batch_size]
+        """
+        logits = self.get_second_last_token_logits(input_ids, attention_mask) # [batch_size, vocab_size]
+        prob = F.softmax(logits, -1) # [batch_size, vocab_size]
+        # get the probability of the correct label 
+        prob = torch.gather(prob, -1, label.unsqueeze(-1)) # [batch_size, 1]
+        return prob # [batch_size, 1]
+    
+    @torch.no_grad()
+    def get_pull_reward_prob(self, 
+                            input_ids: torch.Tensor, 
+                            attention_mask: torch.Tensor,
+                            context_mask: torch.Tensor,
+                            label_prob: torch.Tensor,
+                            pull_mask: torch.Tensor):
+        """
+        input_ids: [batch_size, sequence_length]
+        attention_mask: [batch_size, sequence_length]
+        context_mask: [batch_size, sequence_length]
+        label_prob: [batch_size, 1]
+        pull_mask: [batch_size, sequence_length-1]
+        """
+        # We heed the pull mask to be as small as possible 
+        pull_mask = pull_mask * context_mask[:, :-1] # [batch_size, sequence_length-1]
+        pull_ratio = (pull_mask.sum(-1, keepdim=True).float()) / (context_mask[:, :-1].sum(-1, keepdim=True).float()) # [batch_size, 1] 
+
+        # Calculate the token prediction probability
+        masked_inputs = get_mab_masked_inputs(input_ids, attention_mask, context_mask, pull_mask, self.tokenizer)
+        masked_input_ids = masked_inputs['input_ids']
+        masked_attention_mask = masked_inputs['attention_mask']
+
+        #  probability of the correct label
+        prob = self.get_pull_prob(masked_input_ids, masked_attention_mask, label=input_ids[:, -1])# [batch_size, 1]
+
+        # reward =  (1-correct) * pull_ratio # [batch_size]
+        # reward = prob / (pull_ratio+1) # [batch_size]
+        # reward = prob + (1 - pull_ratio) * label_prob # [batch_size, 1]
+        reward = prob / (pull_ratio + 1e-5)
 
         return reward
 
@@ -262,9 +353,6 @@ class MABTrainer:
         else:
             return dist.sample()
     
-
-
-
 
 
 
@@ -300,9 +388,12 @@ def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
     # Get the generated portions
     generated_portions = generated_outputs['input_ids'][:, input_length:]
     generated_masks = generated_outputs['attention_mask'][:, input_length:]
+    generated_context_masks = generated_masks.clone()
+    generated_context_masks[:, :2] = 0 # the first two tokens are \n
     
     cut_sequences = []
     cut_masks = []
+    cut_context_masks = []
     max_length = 0
     
     for i in range(batch_size):
@@ -310,7 +401,8 @@ def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
         gen_length = generated_masks[i].sum().item()
         if gen_length > 0:
             # Randomly choose cut point
-            cut_point = torch.randint(1, gen_length+1, (1,)).item()
+            # Note there are two \n start the generated sequence, so we need to cut after the second \n
+            cut_point = torch.randint(2, gen_length+1, (1,)).item()
             # Combine input sequence with cut generated sequence
             full_seq = torch.cat([
                 inputs['input_ids'][i],
@@ -320,13 +412,19 @@ def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
                 inputs['attention_mask'][i],
                 generated_masks[i][:cut_point]
             ])
+            full_context_mask = torch.cat([         
+                inputs['context_mask'][i],
+                generated_context_masks[i][:cut_point]
+            ])
         else:
             # If no generation, just use input sequence
             full_seq = inputs['input_ids'][i]
             full_mask = inputs['attention_mask'][i]
+            full_context_mask = inputs['context_mask'][i]
             
         cut_sequences.append(full_seq)
         cut_masks.append(full_mask)
+        cut_context_masks.append(full_context_mask)
         max_length = max(max_length, len(full_seq))
     
     # Left pad all sequences to max_length
@@ -338,15 +436,18 @@ def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
                                 dtype=inputs['attention_mask'].dtype,
                                 device=device)
     
+    new_context_masks = torch.zeros_like(attention_masks).to(device)
     # Fill in the sequences from the right
-    for i, (seq, mask) in enumerate(zip(cut_sequences, cut_masks)):
+    for i, (seq, mask, context_mask) in enumerate(zip(cut_sequences, cut_masks, cut_context_masks)):
         seq_len = len(seq)
         start_idx = max_length - seq_len
         padded_sequences[i, start_idx:] = seq
         attention_masks[i, start_idx:] = mask  # Use the original attention mask values
+        new_context_masks[i, start_idx:] = context_mask
     
     return {
         'input_ids': padded_sequences,
-        'attention_mask': attention_masks
+        'attention_mask': attention_masks,
+        'context_mask': new_context_masks
     }
 

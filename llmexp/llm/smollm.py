@@ -15,6 +15,10 @@ class LLMWrapper(nn.Module):
 
     def forward(self, input_ids, attention_mask, **kwargs):
         return self.model(input_ids, attention_mask=attention_mask, **kwargs)
+
+    def get_logits(self, input_ids, attention_mask, **kwargs):
+        outputs = self.model.forward(input_ids, attention_mask, **kwargs)
+        return outputs.logits
     
     def generate(self, 
                  input_ids,
@@ -22,7 +26,8 @@ class LLMWrapper(nn.Module):
                  max_new_tokens=50, 
                  temperature=0.2, 
                  top_p=0.9, 
-                 do_sample=True):
+                 do_sample=True,
+                 **kwargs):
         generated = self.model.generate(input_ids, 
                                     attention_mask=attention_mask,
                                     max_new_tokens=max_new_tokens, 
