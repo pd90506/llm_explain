@@ -82,16 +82,13 @@ class MABModel(nn.Module):
 
         return logits, value
     
-    def get_dist_value(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs):
+    def get_logits_value(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs):
         """
-        Get the distribution and the MAB values.
+        Get the logits and the MAB values.
         """
         logits, value = self.forward(input_ids, attention_mask)
-        probs = torch.sigmoid(logits)
 
-        dist = torch.distributions.Bernoulli(probs=probs)
-
-        return dist, value # 
+        return logits, value # logits: [batch_size, sequence_length-1], value: [batch_size, 1]
 
     # Public methods that users will commonly use
     def state_dict(self, *args, **kwargs):

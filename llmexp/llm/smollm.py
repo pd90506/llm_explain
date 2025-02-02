@@ -72,6 +72,7 @@ class LLMWrapper(nn.Module):
             input_text,
             truncation=True,
             max_length=512,
+            add_special_tokens=False,
             return_tensors="pt"
         ).to(self.device)
         

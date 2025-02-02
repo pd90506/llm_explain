@@ -73,6 +73,8 @@ class DataCollator:
 
         self.begin_marker = "<|begin_of_text|>"
         self.system_markers = ("<|start_header_id|>system<|end_header_id|>", "<|eot_id|>")
+        self.time_marker = "\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n"
+        # self.time_marker = "\n\n"
         self.user_markers = ("<|start_header_id|>sentence<|end_header_id|>", "<|eot_id|>")
         self.prompt_marker = "<|start_header_id|>assistant<|end_header_id|>"
 
@@ -81,7 +83,7 @@ class DataCollator:
 
     def _create_prompt_parts(self, user_input: str) -> Tuple[str, str, str]:
         """Return (prefix, user_content, suffix) with explicit markers"""
-        prefix = self.begin_marker + self.system_markers[0] + "\n\n" + self.instruction + self.system_markers[1]
+        prefix = self.begin_marker + self.system_markers[0] + self.time_marker + self.instruction + self.system_markers[1] 
         user_prefix = self.user_markers[0] + "\n\n"
         user_suffix = self.user_markers[1]
         suffix = self.prompt_marker
@@ -142,7 +144,8 @@ class DataCollator:
             # context_mask = F.pad(context_mask, (0, pad_length), value=0)
             
             # Create attention mask
-            attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+            # attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+            attention_mask = torch.ones_like(input_ids).long().to(input_ids.device)
             
             input_ids_list.append(input_ids)
             attention_masks_list.append(attention_mask)

@@ -7,6 +7,7 @@ import transformers
 from llmexp.utils import get_mab_masked_inputs
 import wandb
 from tqdm import tqdm
+from llmexp.utils.model_utils import GumbelKHotDistribution
 
 
 class MABTrainer:
@@ -33,33 +34,39 @@ class MABTrainer:
         self.minibatch_size = config['minibatch_size']
         self.clip_epsilon = config['clip_epsilon']
 
+        self.lambda_entropy = config['lambda_entropy']
+
+        self.topk = config['topk']
+        self.temperature = 1.0
+
+
+
     def train(self, dataloader: torch.utils.data.DataLoader, gamma=0.9):
         """
         dataloader: DataLoader object
         """
 
-        num_pulls = self.num_pulls
         for batch_idx, batch in tqdm(enumerate(dataloader), desc="Training MAB"):
             # Generate the response from the target model
             batch = batch.to(self.device)
             generated_outputs = self.target_model.generate(batch['input_ids'], attention_mask=batch['attention_mask'])
             # Randomly cut and pad to align sequences such that the last token is the MAB label
-            random_cut_generated_outputs = randomly_cut_and_pad_generations(batch, generated_outputs, self.tokenizer)
+            processed = randomly_cut_and_pad_generations(batch, generated_outputs, self.tokenizer)
 
-            input_ids = random_cut_generated_outputs['input_ids'].to(self.device)
-            attention_mask = random_cut_generated_outputs['attention_mask'].to(self.device)
-            context_mask = random_cut_generated_outputs['context_mask'].to(self.device)
+            input_ids = processed['input_ids'].to(self.device)
+            attention_mask = processed['attention_mask'].to(self.device)
+            context_mask = processed['context_mask'].to(self.device)
 
             # get the probability of the correct label
-            label_prob = self.get_pull_prob(input_ids, attention_mask, label=input_ids[:, -1]) # [batch_size, 1]
+            label_prob = self.get_pull_prob(input_ids, attention_mask, input_ids[:, -1])
 
-            dist, value = self.mab_model.get_dist_value(input_ids, attention_mask)
+            logits, value = self.mab_model.get_logits_value(input_ids, attention_mask)
+            dist = GumbelKHotDistribution(logits=logits, context_mask=context_mask[:, :-1], k=self.topk, temperature=self.temperature)
 
-            pulls = self.collect_pulls(input_ids, attention_mask, context_mask, label_prob, dist, value, num_pulls)
+            pulls = self.collect_pulls(input_ids, attention_mask, context_mask, label_prob, dist, value, num_pulls=self.num_pulls, gamma=gamma)
 
-            ppo_iterator = self.ppo_iter(self.minibatch_size, pulls)
-            for ppo_epoch in range(self.config['ppo_epochs']):
-                for minibatch in ppo_iterator:
+            for _ in range(self.config['ppo_epochs']):
+                for minibatch in self.ppo_iter(self.minibatch_size, pulls):
                     ppo_info_dict = self.train_ppo_minibatch(minibatch)
 
             # log 
@@ -86,58 +93,57 @@ class MABTrainer:
         """Collect pull results for MAB training.
         
         """
-        # Initialize lists for PPO
-        log_probs_list, pull_masks_list, rewards_list, values_list = [], [], [], []
-                            
-        # Collect pulls
-        for _ in range(num_pulls):
-            pull_mask = dist.sample() # [batch_size, sequence_length-1]
-            # rewards = self.get_pull_reward_acc(input_ids, attention_mask, context_mask, pull_mask).unsqueeze(-1) # [batch_size, 1]
-            rewards = self.get_pull_reward_prob(input_ids, attention_mask, context_mask, label_prob, pull_mask) # [batch_size, 1]
-            log_prob = self.get_log_probs(dist, context_mask, pull_mask) # [batch_size, 1]
-            log_probs_list.append(log_prob.clone())
-            rewards_list.append(rewards.clone())
-            pull_masks_list.append(pull_mask.clone())
-            values_list.append(value.clone())
+        # Initialize lists to gather pull outputs
+        pulls = [self._get_single_pull(input_ids, attention_mask, context_mask, label_prob, dist, value)
+                 for _ in range(num_pulls)]
+        # Stack the individual pull outputs along a new axis and flatten out the batch dimension
+        log_probs = torch.cat([p['log_prob'] for p in pulls], dim=0)
+        rewards = torch.cat([p['reward'] for p in pulls], dim=0)
+        pull_masks = torch.cat([p['pull_mask'] for p in pulls], dim=0)
 
-
-        returns_list = self.compute_returns(rewards_list, values_list, gamma=gamma, lam=lam)
-        returns = torch.cat(returns_list, dim=0) # [batch_size * num_pulls, 1]
-        log_probs = torch.cat(log_probs_list, dim=0) # [batch_size * num_pulls, 1]
-        rewards = torch.cat(rewards_list, dim=0) # [batch_size * num_pulls, 1]
-        pull_masks = torch.cat(pull_masks_list, dim=0) # [batch_size * num_pulls, sequence_length-1]
-        input_ids = input_ids.repeat(num_pulls, 1) # [batch_size * num_pulls, sequence_length]
-        attention_masks = attention_mask.repeat(num_pulls, 1) # [batch_size * num_pulls, sequence_length]
-        context_masks = context_mask.repeat(num_pulls, 1) # [batch_size * num_pulls, sequence_length]
-        label_probs = label_prob.repeat(num_pulls, 1) # [batch_size * num_pulls, 1]
+        returns_list = self.compute_returns([p['reward'] for p in pulls],
+                                             [p['value'] for p in pulls], gamma, lam)
+        returns = torch.cat(returns_list, dim=0)
+        batch_rep = lambda t: t.repeat(num_pulls, 1)
         return {
             'log_probs': log_probs,
             'pull_masks': pull_masks,
-            'input_ids': input_ids,
-            'attention_masks': attention_masks,
-            'context_masks': context_masks,
+            'input_ids': batch_rep(input_ids),
+            'attention_masks': batch_rep(attention_mask),
+            'context_masks': batch_rep(context_mask),
             'rewards': rewards,
             'returns': returns,
-            'label_probs': label_probs,
+            'label_probs': batch_rep(label_prob),
+        }
+
+    def _get_single_pull(self, input_ids, attention_mask, context_mask, label_prob, dist, value):
+        # Sample a pull mask and compute related reward and log probability
+        pull_mask = dist.sample()
+
+        reward = self.get_pull_reward_prob(input_ids, attention_mask, context_mask, label_prob, pull_mask)
+        log_prob = self.get_log_probs(dist, context_mask, pull_mask)
+        return {
+            'log_prob': log_prob.clone(),
+            'reward': reward.clone(),
+            'pull_mask': pull_mask.clone(),
+            'value': value.clone(),
         }
 
     def compute_returns(self, rewards: list[torch.Tensor], 
                         value: list[torch.Tensor],
                         gamma: float = 0.99,
-                        lam: float = 0.95) -> torch.Tensor:
+                        lam: float = 0.95) -> list:
         """
         Compute the returns for the rewards
         """
-        num_steps = len(rewards)
-        returns = [] 
+        returns = []
         last_advantage = 0
-        for i in reversed(range(num_steps)):
-            next_non_terminal = 1.0
-            delta = rewards[i] + gamma * value[i] * next_non_terminal - value[i]
-            last_advantage = delta + gamma * lam * next_non_terminal * last_advantage
-            returns.append(last_advantage + value[i])
-        return returns # list of [batch_size, 1]
-
+        # Iterate backwards over the rewards
+        for r, v in zip(reversed(rewards), reversed(value)):
+            delta = r + gamma * v - v
+            last_advantage = delta + gamma * lam * last_advantage
+            returns.insert(0, (last_advantage + v))
+        return returns
 
     def ppo_iter(self, minibatch_size: int, pulls: Dict):
         """
@@ -155,7 +161,8 @@ class MABTrainer:
         """
         minibatch: Dict
         """
-        dist, value = self.mab_model.get_dist_value(minibatch['input_ids'], minibatch['attention_masks'])
+        logits, value = self.mab_model.get_logits_value(minibatch['input_ids'], minibatch['attention_masks'])
+        dist = GumbelKHotDistribution(logits=logits, context_mask=minibatch['context_masks'][:, :-1], k=self.topk, temperature=self.temperature)
 
         pull_masks = minibatch['pull_masks'] # [batch_size, sequence_length-1]
         context_masks = minibatch['context_masks'] # [batch_size, sequence_length]
@@ -167,17 +174,18 @@ class MABTrainer:
         actor_loss = self.get_mab_actor_loss(dist, value, context_masks, pull_masks, returns, log_probs)
         critic_loss = (returns - value).pow(2).mean()
 
-        entropy = (dist.entropy() * _context_mask.float()).sum(dim=-1, keepdim=True) / _context_mask.sum(dim=-1, keepdim=True) # [batch_size, 1]
+        # entropy = (dist.entropy() * _context_mask.float()).sum(dim=-1, keepdim=True) / _context_mask.sum(dim=-1, keepdim=True) # [batch_size, 1]
+        entropy = dist.entropy()
         entropy = entropy.mean()
 
         mask_ratio = (pull_masks * _context_mask).sum(-1).float() / _context_mask.sum(-1).float() # [batch_size]
         mask_ratio = mask_ratio.mean()
 
-        # limit dist prob to close to 0.5
-        dist_probs = (dist.probs * _context_mask.float()).sum(-1, keepdim=True) / _context_mask.sum(-1, keepdim=True) # [batch_size, 1]
-        prob_loss = (dist_probs - 0.5).pow(2).mean()
+        # # limit dist prob to close to 0.5
+        # dist_probs = (dist.probs * _context_mask.float()).sum(-1, keepdim=True) / _context_mask.sum(-1, keepdim=True) # [batch_size, 1]
+        # prob_loss = (dist_probs - 0.5).pow(2).mean()
 
-        loss = actor_loss + 0.5 * critic_loss - 0.0001 * entropy + 0.1 * prob_loss
+        loss = actor_loss + 0.5 * critic_loss - self.lambda_entropy * entropy #+ 0.1 * prob_loss
 
         # update the mab model
         self.optimizer.zero_grad()
@@ -198,7 +206,7 @@ class MABTrainer:
         }
 
 
-    def get_log_probs(self, dist: torch.distributions.Distribution, 
+    def get_log_probs(self, dist, 
                       context_masks: torch.Tensor,
                        pull_masks: torch.Tensor):
         """
@@ -208,9 +216,9 @@ class MABTrainer:
         # total log prob 
         context_masks = context_masks[:, :-1]
         log_probs = dist.log_prob(pull_masks * context_masks) # [batch_size, sequence_length-1] 
-        total_log_prob = (log_probs * context_masks).sum(-1, keepdim=True) # [batch_size, 1]
+        # total_log_prob = (log_probs * context_masks).sum(-1, keepdim=True) # [batch_size, 1]
 
-        return total_log_prob
+        return log_probs.unsqueeze(-1)
 
 
     def get_mab_actor_loss(self, dist: torch.distributions.Distribution, 
@@ -229,12 +237,12 @@ class MABTrainer:
         """
 
         # Calculate the advantage
-        advantage = returns - value.clone().detach() 
+        advantage = returns - value.detach() 
 
         # Calculate the ppo loss 
         new_log_probs = self.get_log_probs(dist, context_masks, pull_masks) # [batch_size, 1]
         
-        old_log_probs = log_probs.clone().detach() # [batch_size, 1]
+        old_log_probs = log_probs.detach() # [batch_size, 1]
         ratio = (new_log_probs - old_log_probs).exp()
 
         surr1 = advantage * ratio
@@ -325,7 +333,7 @@ class MABTrainer:
         """
         # We heed the pull mask to be as small as possible 
         pull_mask = pull_mask * context_mask[:, :-1] # [batch_size, sequence_length-1]
-        pull_ratio = (pull_mask.sum(-1, keepdim=True).float()) / (context_mask[:, :-1].sum(-1, keepdim=True).float()) # [batch_size, 1] 
+        # pull_ratio = (pull_mask.sum(-1, keepdim=True).float()) / (context_mask[:, :-1].sum(-1, keepdim=True).float()) # [batch_size, 1] 
 
         # Calculate the token prediction probability
         masked_inputs = get_mab_masked_inputs(input_ids, attention_mask, context_mask, pull_mask, self.tokenizer)
@@ -335,11 +343,13 @@ class MABTrainer:
         #  probability of the correct label
         prob = self.get_pull_prob(masked_input_ids, masked_attention_mask, label=input_ids[:, -1])# [batch_size, 1]
 
+        # correct = self.is_pull_correct(masked_input_ids, masked_attention_mask, label=input_ids[:, -1]) # [batch_size]
+
         # reward =  (1-correct) * pull_ratio # [batch_size]
         # reward = prob / (pull_ratio+1) # [batch_size]
         # reward = prob + (1 - pull_ratio) * label_prob # [batch_size, 1]
-        reward = prob / (pull_ratio + 1e-5)
-
+        # reward = prob * (1 - correct) + (label_prob / ((pull_ratio+1)/2)) * correct
+        reward = label_prob - prob  # the degradation after masking
         return reward
 
 
