@@ -37,7 +37,7 @@ class MABTrainer:
         self.lambda_entropy = config['lambda_entropy']
 
         self.topk = config['topk']
-        self.temperature = 1.0
+        self.temperature = config['temperature']
 
 
 
