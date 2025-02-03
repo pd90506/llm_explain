@@ -104,6 +104,7 @@ class MABTrainer:
         returns_list = self.compute_returns([p['reward'] for p in pulls],
                                              [p['value'] for p in pulls], gamma, lam)
         returns = torch.cat(returns_list, dim=0)
+        logits = dist.logits
         batch_rep = lambda t: t.repeat(num_pulls, 1)
         return {
             'log_probs': log_probs,
@@ -114,6 +115,7 @@ class MABTrainer:
             'rewards': rewards,
             'returns': returns,
             'label_probs': batch_rep(label_prob),
+            'old_logits': batch_rep(logits),
         }
 
     def _get_single_pull(self, input_ids, attention_mask, context_mask, label_prob, dist, value):
@@ -170,8 +172,9 @@ class MABTrainer:
 
         log_probs = minibatch['log_probs'] # [batch_size, 1]
         returns = minibatch['returns'] # [batch_size, 1]
+        old_logits = minibatch['old_logits'] # [batch_size, sequence_length-1]
 
-        actor_loss = self.get_mab_actor_loss(dist, value, context_masks, pull_masks, returns, log_probs)
+        actor_loss = self.get_mab_actor_loss(dist, old_logits, value, context_masks, pull_masks, returns, log_probs)
         critic_loss = (returns - value).pow(2).mean()
 
         # entropy = (dist.entropy() * _context_mask.float()).sum(dim=-1, keepdim=True) / _context_mask.sum(dim=-1, keepdim=True) # [batch_size, 1]
@@ -222,11 +225,12 @@ class MABTrainer:
 
 
     def get_mab_actor_loss(self, dist: torch.distributions.Distribution, 
-                            value: torch.Tensor, 
-                            context_masks: torch.Tensor,
-                            pull_masks: torch.Tensor, 
-                            returns: torch.Tensor, 
-                            log_probs: torch.Tensor):
+                           old_logits: torch.Tensor,
+                           value: torch.Tensor, 
+                           context_masks: torch.Tensor,
+                           pull_masks: torch.Tensor, 
+                           returns: torch.Tensor, 
+                           log_probs: torch.Tensor):
         """ 
         dist: torch.distributions.Distribution
         value: [batch_size, 1]
@@ -238,16 +242,26 @@ class MABTrainer:
 
         # Calculate the advantage
         advantage = returns - value.detach() 
+        context_masks = context_masks[:, :-1]
+        pull_masks = pull_masks.detach() * context_masks
 
-        # Calculate the ppo loss 
-        new_log_probs = self.get_log_probs(dist, context_masks, pull_masks) # [batch_size, 1]
-        
-        old_log_probs = log_probs.detach() # [batch_size, 1]
-        ratio = (new_log_probs - old_log_probs).exp()
+        # get new logits 
+        new_logits = dist.logits 
+        new_logits_masked = new_logits.masked_fill(context_masks == 0, -float('inf'))
+        new_logprobs_masked = F.log_softmax(new_logits_masked, -1)
+        new_logprobs_masked = new_logprobs_masked.masked_fill(new_logits_masked < 1e-10, 0)
+        # get old logits
+        updated_old_logits = old_logits + advantage * pull_masks
+        updated_old_logits_masked = updated_old_logits.masked_fill(context_masks == 0, -float('inf'))
+        updated_old_logprobs_masked = F.log_softmax(updated_old_logits_masked, -1)
+        updated_old_logprobs_masked = updated_old_logprobs_masked.masked_fill(updated_old_logits_masked < 1e-10, 0)
 
-        surr1 = advantage * ratio
-        surr2 = advantage * torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon)
-        actor_loss = - torch.min(surr1, surr2).mean()
+        # get the ratio
+        ratio = (new_logprobs_masked - updated_old_logprobs_masked).exp()
+
+        surr1 = (ratio - 1.0).pow(2)
+        surr2 = (torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon) - 1.0).pow(2)
+        actor_loss = torch.min(surr1, surr2).mean()
 
         return actor_loss
 
