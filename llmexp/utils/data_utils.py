@@ -2,7 +2,8 @@ from datasets import load_dataset, Dataset
 from typing import Tuple, Dict, List, Any
 import torch
 from torch.utils.data import DataLoader
-from transformers import PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase, BatchEncoding
+import torch.nn.functional as F
 
 
 def load_sst2(split: str = "train") -> Tuple[List[str], List[int]]:
@@ -62,39 +63,34 @@ class LLMDataset(Dataset):
     
 
 class DataCollator:
-    """Collate function for batching examples."""
-    def __init__(self, tokenizer: Any, max_length: int = 512, instruction: str = None):
+    def __init__(self, tokenizer: Any, max_length: int = 512, instruction=None):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.instruction = instruction
+        if instruction is None:
+            self.instruction = "Analyze the sentiment of the following sentence and respond with only one word: 'positive,' 'negative,' or 'neutral,' based on the overall tone and meaning of the sentence. Do not provide any additional explanation."
+        else:
+            self.instruction = instruction
 
-        # Set pad token to eos token
+        self.begin_marker = "<|begin_of_text|>"
+        self.system_markers = ("<|start_header_id|>system<|end_header_id|>", "<|eot_id|>")
+        self.time_marker = "\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n"
+        # self.time_marker = "\n\n"
+        self.user_markers = ("<|start_header_id|>sentence<|end_header_id|>", "<|eot_id|>")
+        self.prompt_marker = "<|start_header_id|>assistant<|end_header_id|>"
+
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-    
-    def format_example(self, example: str, max_length: int = 512) -> str:
-        # Truncate the input text to fit within token limit
-        truncated_input = self.tokenizer.decode(
-            self.tokenizer.encode(example, truncation=True, max_length=max_length),  
-            skip_special_tokens=True
-        )
-        
-        if self.instruction is not None:
-            instruction = self.instruction
-        else:
-            instruction = "Analyze the sentiment of the following sentence and respond with only one word: 'positive,' 'negative,' or 'neutral,' based on the overall tone and meaning of the sentence. Do not provide any additional explanation."
-        content = [
-            {"role": "system", 
-             "content": instruction
-            },
-            {"role": "user", 
-             "content": truncated_input
-            }
-        ]
-        return self.tokenizer.apply_chat_template(content, tokenize=False, add_generation_prompt=True)
-    
-    def __call__(self, examples: List[Dict]) -> Dict:
+    def _create_prompt_parts(self, user_input: str) -> Tuple[str, str, str]:
+        """Return (prefix, user_content, suffix) with explicit markers"""
+        prefix = self.begin_marker + self.system_markers[0] + self.time_marker + self.instruction + self.system_markers[1] 
+        user_prefix = self.user_markers[0] + "\n\n"
+        user_suffix = self.user_markers[1]
+        suffix = self.prompt_marker
+        return prefix + user_prefix, user_input, user_suffix + suffix
+
+
+    def __call__(self, examples: List[Dict]) -> BatchEncoding:
         """
         Tokenize and batch examples.
         
@@ -102,24 +98,77 @@ class DataCollator:
             examples: List of dictionaries containing 'sentence' and optionally 'label'
             
         Returns:
-            Dict containing batched tensors
+            BatchEncoding: BatchEncoding containing batched tensors
         """
-        # Extract sentence and labels
-        prompts = [self.format_example(example['sentence'], max_length=self.max_length) for example in examples]
-        
-        # Tokenize all prompts in the batch
-        batch = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        )
-        
-        # Add labels if they exist
-        if 'label' in examples[0]:
-            batch['labels'] = torch.tensor([example['label'] for example in examples])
+        # Process each example
+        input_ids_list = []
+        attention_masks_list = []
+        context_masks_list = []
+
+        for example in examples:
+            prefix, user_input, suffix = self._create_prompt_parts(example['sentence'])
+
+            # Tokenize each part separately
+            prefix_tokens = self.tokenizer.encode(
+                prefix, 
+                add_special_tokens=False, 
+                truncation=False
+            )
             
-        return batch
+            suffix_tokens = self.tokenizer.encode(
+                suffix,
+                add_special_tokens=False,
+                truncation=False
+            )
+
+            user_input_tokens = self.tokenizer.encode(
+                user_input,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=self.max_length - len(prefix_tokens) - len(suffix_tokens)
+            )
+        
+            # Combine tokens
+            full_tokens = prefix_tokens + user_input_tokens + suffix_tokens
+            input_ids = torch.tensor(full_tokens[:self.max_length]) # truncate to max length or simply return the full tokens
+            
+            # Create context mask
+            context_mask = torch.zeros(len(full_tokens), dtype=torch.long)
+            user_start = len(prefix_tokens)
+            user_end = user_start + len(user_input_tokens)
+            context_mask[user_start:user_end] = 1
+            
+            # # Pad sequences
+            # pad_length = self.max_length - len(input_ids)
+            # input_ids = F.pad(input_ids, (0, pad_length), value=self.tokenizer.pad_token_id)
+            # context_mask = F.pad(context_mask, (0, pad_length), value=0)
+            
+            # Create attention mask
+            # attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+            attention_mask = torch.ones_like(input_ids).long().to(input_ids.device)
+            
+            input_ids_list.append(input_ids)
+            attention_masks_list.append(attention_mask)
+            context_masks_list.append(context_mask)
+        
+        # left pad the sequences to the max length
+        batch_max_length = max(len(input_ids) for input_ids in input_ids_list)
+        for i in range(len(input_ids_list)):
+            input_ids_list[i] = F.pad(input_ids_list[i], (batch_max_length - len(input_ids_list[i]), 0), value=self.tokenizer.pad_token_id)
+            attention_masks_list[i] = F.pad(attention_masks_list[i], (batch_max_length - len(attention_masks_list[i]), 0), value=0)
+            context_masks_list[i] = F.pad(context_masks_list[i], (batch_max_length - len(context_masks_list[i]), 0), value=0)
+
+        # Convert to batches
+        batch = {
+            'input_ids': torch.stack(input_ids_list),
+            'attention_mask': torch.stack(attention_masks_list),
+            'context_mask': torch.stack(context_masks_list)
+        }
+        
+        if 'label' in examples[0]:
+            batch['labels'] = torch.tensor([ex['label'] for ex in examples])
+            
+        return BatchEncoding(batch)
     
 
 def create_dataloader(
