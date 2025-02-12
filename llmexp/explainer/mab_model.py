@@ -48,7 +48,6 @@ class MABModel(nn.Module):
 
         self.actor_head = nn.Linear(hidden_size, 1)
 
-        # self.log_scale = nn.Parameter(torch.tensor(0.0))
 
         # Freeze the base model if required
         if freeze_base:

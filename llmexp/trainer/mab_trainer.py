@@ -39,6 +39,8 @@ class MABTrainer:
         self.topk = config['topk']
         self.temperature = 1.0
 
+        self.loss_fn = nn.MSELoss()
+
 
 
     def train(self, dataloader: torch.utils.data.DataLoader, gamma=0.9):
@@ -67,11 +69,11 @@ class MABTrainer:
 
             for _ in range(self.config['ppo_epochs']):
                 for minibatch in self.ppo_iter(self.minibatch_size, pulls):
-                    ppo_info_dict = self.train_ppo_minibatch(minibatch)
+                    mab_info_dict = self.train_mab_minibatch(minibatch)
 
             # log 
 
-            wandb.log(ppo_info_dict)
+            wandb.log(mab_info_dict)
 
             # save the model
             if batch_idx % self.config['save_interval'] == 0:
@@ -97,7 +99,6 @@ class MABTrainer:
         pulls = [self._get_single_pull(input_ids, attention_mask, context_mask, label_prob, dist, value)
                  for _ in range(num_pulls)]
         # Stack the individual pull outputs along a new axis and flatten out the batch dimension
-        log_probs = torch.cat([p['log_prob'] for p in pulls], dim=0)
         rewards = torch.cat([p['reward'] for p in pulls], dim=0)
         pull_masks = torch.cat([p['pull_mask'] for p in pulls], dim=0)
 
@@ -107,7 +108,6 @@ class MABTrainer:
         logits = dist.logits
         batch_rep = lambda t: t.repeat(num_pulls, 1)
         return {
-            'log_probs': log_probs,
             'pull_masks': pull_masks,
             'input_ids': batch_rep(input_ids),
             'attention_masks': batch_rep(attention_mask),
@@ -123,9 +123,7 @@ class MABTrainer:
         pull_mask = dist.sample()
 
         reward = self.get_pull_reward_prob(input_ids, attention_mask, context_mask, label_prob, pull_mask)
-        log_prob = self.get_log_probs(dist, context_mask, pull_mask)
         return {
-            'log_prob': log_prob.clone(),
             'reward': reward.clone(),
             'pull_mask': pull_mask.clone(),
             'value': value.clone(),
@@ -159,7 +157,7 @@ class MABTrainer:
             rand_ids = torch.randint(0, batch_size, (minibatch_size,), device=self.device)
             yield {key: value[rand_ids] for key, value in pulls.items()}
     
-    def train_ppo_minibatch(self, minibatch: Dict):
+    def train_mab_minibatch(self, minibatch: Dict):
         """
         minibatch: Dict
         """
@@ -170,12 +168,13 @@ class MABTrainer:
         context_masks = minibatch['context_masks'] # [batch_size, sequence_length]
         _context_mask = context_masks[:, :-1] # [batch_size, sequence_length-1]
 
-        log_probs = minibatch['log_probs'] # [batch_size, 1]
-        returns = minibatch['returns'] # [batch_size, 1]
+        # log_probs = minibatch['log_probs'] # [batch_size, 1]
+        # returns = minibatch['returns'] # [batch_size, 1]
+        reward = minibatch['rewards'] # [batch_size, 1]
         old_logits = minibatch['old_logits'] # [batch_size, sequence_length-1]
 
-        actor_loss = self.get_mab_actor_loss(dist, old_logits, value, context_masks, pull_masks, returns, log_probs)
-        critic_loss = (returns - value).pow(2).mean()
+        actor_loss = self.get_mab_actor_loss(dist, old_logits, value, context_masks, pull_masks, reward)
+        # critic_loss = (returns - value).pow(2).mean()
 
         # entropy = (dist.entropy() * _context_mask.float()).sum(dim=-1, keepdim=True) / _context_mask.sum(dim=-1, keepdim=True) # [batch_size, 1]
         entropy = dist.entropy()
@@ -188,7 +187,7 @@ class MABTrainer:
         # dist_probs = (dist.probs * _context_mask.float()).sum(-1, keepdim=True) / _context_mask.sum(-1, keepdim=True) # [batch_size, 1]
         # prob_loss = (dist_probs - 0.5).pow(2).mean()
 
-        loss = actor_loss + 0.5 * critic_loss - self.lambda_entropy * entropy #+ 0.1 * prob_loss
+        loss = actor_loss - self.lambda_entropy * entropy #+ 0.1 * prob_loss
 
         # update the mab model
         self.optimizer.zero_grad()
@@ -200,28 +199,14 @@ class MABTrainer:
         return {
             'loss': loss.item(),
             'actor_loss': actor_loss.item(),
-            'critic_loss': critic_loss.item(),
+            # 'critic_loss': critic_loss.item(),
             'entropy': entropy.item(),
             'mask_ratio': mask_ratio.item(),
-            'returns': returns.mean().item(),
+            # 'returns': returns.mean().item(),
+            'reward': reward.mean().item(),
             'entropy': entropy.item(),
             'value': value.mean().item(),
         }
-
-
-    def get_log_probs(self, dist, 
-                      context_masks: torch.Tensor,
-                       pull_masks: torch.Tensor):
-        """
-        pull_masks: [batch_size, sequence_length-1]
-        context_masks: [batch_size, sequence_length]
-        """
-        # total log prob 
-        context_masks = context_masks[:, :-1]
-        log_probs = dist.log_prob(pull_masks * context_masks) # [batch_size, sequence_length-1] 
-        # total_log_prob = (log_probs * context_masks).sum(-1, keepdim=True) # [batch_size, 1]
-
-        return log_probs.unsqueeze(-1)
 
 
     def get_mab_actor_loss(self, dist: torch.distributions.Distribution, 
@@ -229,39 +214,32 @@ class MABTrainer:
                            value: torch.Tensor, 
                            context_masks: torch.Tensor,
                            pull_masks: torch.Tensor, 
-                           returns: torch.Tensor, 
-                           log_probs: torch.Tensor):
+                           reward: torch.Tensor):
         """ 
         dist: torch.distributions.Distribution
         value: [batch_size, 1]
         context_masks: [batch_size, sequence_length]
         pull_masks: [batch_size, sequence_length-1]
-        returns: [batch_size, 1]
-        log_probs: [batch_size, 1]
+        reward: [batch_size, 1]
         """
 
         # Calculate the advantage
-        advantage = returns - value.detach() 
+        # advantage = returns - value.detach() 
         context_masks = context_masks[:, :-1]
         pull_masks = pull_masks.detach() * context_masks
 
         # get new logits 
         new_logits = dist.logits 
-        new_logits_masked = new_logits.masked_fill(context_masks == 0, -float('inf'))
-        new_logprobs_masked = F.log_softmax(new_logits_masked, -1)
-        new_logprobs_masked = new_logprobs_masked.masked_fill(new_logits_masked < 1e-10, 0)
+        new_logits_masked = new_logits * context_masks
+        
         # get old logits
-        updated_old_logits = old_logits + advantage * pull_masks
-        updated_old_logits_masked = updated_old_logits.masked_fill(context_masks == 0, -float('inf'))
-        updated_old_logprobs_masked = F.log_softmax(updated_old_logits_masked, -1)
-        updated_old_logprobs_masked = updated_old_logprobs_masked.masked_fill(updated_old_logits_masked < 1e-10, 0)
+        delta = 100 * reward * pull_masks
+        # Where delta is 0, use old_logits. Where delta is non-zero, use delta
+        updated_old_logits = torch.where(delta == 0, old_logits, delta)
+        # Optional: Apply exponential moving average
+        updated_old_logits = 0.8 * old_logits + 0.2 * updated_old_logits
 
-        # get the ratio
-        ratio = (new_logprobs_masked - updated_old_logprobs_masked).exp()
-
-        surr1 = (ratio - 1.0).pow(2)
-        surr2 = (torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon) - 1.0).pow(2)
-        actor_loss = torch.min(surr1, surr2).mean()
+        actor_loss = self.loss_fn(new_logits_masked * context_masks, updated_old_logits.detach() * context_masks)
 
         return actor_loss
 
@@ -357,12 +335,6 @@ class MABTrainer:
         #  probability of the correct label
         prob = self.get_pull_prob(masked_input_ids, masked_attention_mask, label=input_ids[:, -1])# [batch_size, 1]
 
-        # correct = self.is_pull_correct(masked_input_ids, masked_attention_mask, label=input_ids[:, -1]) # [batch_size]
-
-        # reward =  (1-correct) * pull_ratio # [batch_size]
-        # reward = prob / (pull_ratio+1) # [batch_size]
-        # reward = prob + (1 - pull_ratio) * label_prob # [batch_size, 1]
-        # reward = prob * (1 - correct) + (label_prob / ((pull_ratio+1)/2)) * correct
         reward = label_prob - prob  # the degradation after masking
         return reward
 
