@@ -15,7 +15,10 @@ class GumbelKHotDistribution:
         
         # Apply mask by setting masked logits to large negative value
         self.masked_logits = logits.masked_fill(~context_mask.bool(), float('-inf'))
-        self.k = k
+        if k < 1:
+            self.k = (context_mask.sum(dim=-1) * k).long()
+        else:
+            self.k = k
         self.temperature = temperature
         
     def sample(self):
@@ -27,12 +30,17 @@ class GumbelKHotDistribution:
         # Apply mask
         masked_noisy_logits = noisy_logits.masked_fill(~self.context_mask.bool(), float('-inf'))
         
-        # Get top-k values
-        _, top_k_indices = torch.topk(masked_noisy_logits, self.k, dim=-1)
+        # Get max k value for padding
+        max_k = self.k.max()
         
-        # Convert to k-hot
+        # Get top-k values (using max_k for padding)
+        _, top_k_indices = torch.topk(masked_noisy_logits, max_k, dim=-1)
+        
+        # Convert to k-hot using batch-specific k values
         k_hot = torch.zeros_like(self.logits)
-        k_hot.scatter_(1, top_k_indices, 1)
+        batch_size = self.logits.size(0)
+        for i in range(batch_size):
+            k_hot[i].scatter_(0, top_k_indices[i, :self.k[i]], 1)
         
         # Ensure we only select valid positions
         k_hot = k_hot * self.context_mask
