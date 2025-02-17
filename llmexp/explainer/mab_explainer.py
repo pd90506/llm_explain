@@ -10,7 +10,7 @@ from tqdm import tqdm
 from llmexp.utils.model_utils import GumbelKHotDistribution
 
 
-class MABTrainer:
+class MABExplainer:
     def __init__(
         self,
         mab_model: MABModel,
@@ -28,19 +28,6 @@ class MABTrainer:
 
         self.config = config
         self.device = device
-        self.optimizer = torch.optim.Adam(self.mab_model.parameters(), lr=config['lr'])
-
-        self.num_pulls = config['num_pulls']
-        self.minibatch_size = config['minibatch_size']
-        self.clip_epsilon = config['clip_epsilon']
-
-        self.lambda_entropy = config['lambda_entropy']
-
-        self.topk = config['topk']
-        self.temperature = 1.0
-
-        self.loss_fn = nn.MSELoss()
-
 
 
     def train(self, dataloader: torch.utils.data.DataLoader, gamma=0.9):
@@ -233,7 +220,7 @@ class MABTrainer:
         new_logits_masked = new_logits * context_masks
         
         # get old logits
-        delta = 10 * reward * pull_masks
+        delta = 100 * reward * pull_masks
         # Where delta is 0, use old_logits. Where delta is non-zero, use delta
         updated_old_logits = torch.where(delta == 0, old_logits, delta)
         # Optional: Apply exponential moving average
@@ -352,9 +339,9 @@ class MABTrainer:
 
 
 
-def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
+def cut_and_pad_generations(inputs, generated_outputs, tokenizer, cut_idx=2):
     """
-    Randomly truncates generated sequences and pads them to a uniform length.
+    Truncates generated sequences at a specific index and pads them to a uniform length.
 
     Args:
         inputs (dict): Original input sequences containing:
@@ -364,19 +351,14 @@ def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
             - input_ids (torch.Tensor): Generated token IDs [batch_size, total_length]
             - attention_mask (torch.Tensor): Generated attention masks [batch_size, total_length]
         tokenizer: Tokenizer object with pad_token_id attribute
+        cut_idx (int): Specific index to cut the generated sequence (default=2)
 
     Returns:
         dict: Processed sequences containing:
             - input_ids (torch.Tensor): Padded token IDs [batch_size, max_length]
             - attention_mask (torch.Tensor): Padded attention masks [batch_size, max_length]
-
-    Note:
-        For each sequence in the batch:
-        1. Takes the original input and a random portion of the generated text
-        2. Concatenates them together
-        3. Left-pads all sequences in the batch to the same length
+            - context_mask (torch.Tensor): Context masks [batch_size, max_length]
     """
-    
     input_length = inputs['input_ids'].shape[1]
     batch_size = inputs['input_ids'].shape[0]
     device = inputs['input_ids'].device
@@ -385,7 +367,7 @@ def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
     generated_portions = generated_outputs['input_ids'][:, input_length:]
     generated_masks = generated_outputs['attention_mask'][:, input_length:]
     generated_context_masks = generated_masks.clone()
-    generated_context_masks[:, :2] = 0 # the first two tokens are \n
+    generated_context_masks[:, :2] = 0  # the first two tokens are \n
     
     cut_sequences = []
     cut_masks = []
@@ -396,21 +378,20 @@ def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
         # Use attention mask to determine valid generated tokens
         gen_length = generated_masks[i].sum().item()
         if gen_length > 0:
-            # Randomly choose cut point
-            # Note there are two \n start the generated sequence, so we need to cut after the second \n
-            cut_point = torch.randint(2, gen_length+1, (1,)).item()
+            # Use specified cut point, ensuring it's within valid range
+            actual_cut_idx = min(max(cut_idx, 2), gen_length)
             # Combine input sequence with cut generated sequence
             full_seq = torch.cat([
                 inputs['input_ids'][i],
-                generated_portions[i][:cut_point]
+                generated_portions[i][:actual_cut_idx]
             ])
             full_mask = torch.cat([
                 inputs['attention_mask'][i],
-                generated_masks[i][:cut_point]
+                generated_masks[i][:actual_cut_idx]
             ])
             full_context_mask = torch.cat([         
                 inputs['context_mask'][i],
-                generated_context_masks[i][:cut_point]
+                generated_context_masks[i][:actual_cut_idx]
             ])
         else:
             # If no generation, just use input sequence
@@ -438,7 +419,7 @@ def randomly_cut_and_pad_generations(inputs, generated_outputs, tokenizer):
         seq_len = len(seq)
         start_idx = max_length - seq_len
         padded_sequences[i, start_idx:] = seq
-        attention_masks[i, start_idx:] = mask  # Use the original attention mask values
+        attention_masks[i, start_idx:] = mask
         new_context_masks[i, start_idx:] = context_mask
     
     return {
