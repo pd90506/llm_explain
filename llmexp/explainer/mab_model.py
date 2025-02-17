@@ -114,31 +114,31 @@ class MABModel(nn.Module):
 
         return logits_list
 
-    # @torch.no_grad()
-    # def inference(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, gen_start_index: int, **kwargs):
-    #     """
-    #     Parallel explanation inference for all generated tokens.
-    #     accept only batch_size = 1
-    #     gen_start_index: the starting index of the generated token
-    #     """
-    #     logits_list = []
-    #     hidden_states = self.base_model.get_hidden_states(input_ids, attention_mask)
-    #     prompt_hidden_states = hidden_states[:, :gen_start_index, :] # [batch_size, gen_start_index, hidden_size]
-    #     prompt_hidden_states = self.prompt_actor(prompt_hidden_states) # [batch_size, gen_start_index, hidden_size]
+    @torch.no_grad()
+    def inference_context(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, gen_start_index: int, **kwargs):
+        """
+        Parallel explanation inference for all generated tokens.
+        accept only batch_size = 1
+        gen_start_index: the starting index of the generated token
+        """
+        logits_list = []
+        hidden_states = self.base_model.get_hidden_states(input_ids, attention_mask)
+        prompt_hidden_states = hidden_states[:, :gen_start_index, :] # [batch_size, gen_start_index, hidden_size]
+        prompt_hidden_states = self.prompt_actor(prompt_hidden_states) # [batch_size, gen_start_index, hidden_size]
 
-    #     generated_hidden_state = hidden_states[:, gen_start_index:, :] # [batch_size, sequence_length-gen_start_index, hidden_size]
-    #     generated_hidden_state = self.generated_actor(generated_hidden_state) # [batch_size, sequence_length-gen_start_index, hidden_size]
+        generated_hidden_state = hidden_states[:, gen_start_index:, :] # [batch_size, sequence_length-gen_start_index, hidden_size]
+        generated_hidden_state = self.generated_actor(generated_hidden_state) # [batch_size, sequence_length-gen_start_index, hidden_size]
         
-    #     for i in range(gen_start_index, input_ids.shape[1]):
-    #         generated_hidden_state = hidden_states[:, i, :].unsqueeze(1) # [batch_size, 1, hidden_size]
-    #         generated_hidden_state = self.generated_actor(generated_hidden_state) # [batch_size, 1, hidden_size]
+        for i in range(gen_start_index, input_ids.shape[1]):
+            generated_hidden_state = hidden_states[:, i, :].unsqueeze(1) # [batch_size, 1, hidden_size]
+            generated_hidden_state = self.generated_actor(generated_hidden_state) # [batch_size, 1, hidden_size]
 
-    #         # Hadamard product between the generated hidden state and the prompt hidden states
-    #         correlated_hidden_states = generated_hidden_state * prompt_hidden_states # [batch_size, gen_start_index, hidden_size]
-    #         logits = self.actor_head(correlated_hidden_states).squeeze(-1) # [batch_size, gen_start_index]
-    #         logits_list.append(logits)
+            # Hadamard product between the generated hidden state and the prompt hidden states
+            correlated_hidden_states = generated_hidden_state * prompt_hidden_states # [batch_size, gen_start_index, hidden_size]
+            logits = self.actor_head(correlated_hidden_states).squeeze(-1) # [batch_size, gen_start_index]
+            logits_list.append(logits)
 
-    #     return logits_list
+        return logits_list
 
 
 

@@ -233,7 +233,7 @@ class MABTrainer:
         new_logits_masked = new_logits * context_masks
         
         # get old logits
-        delta = 100 * reward * pull_masks
+        delta = 10 * reward * pull_masks
         # Where delta is 0, use old_logits. Where delta is non-zero, use delta
         updated_old_logits = torch.where(delta == 0, old_logits, delta)
         # Optional: Apply exponential moving average
