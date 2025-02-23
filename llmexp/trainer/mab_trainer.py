@@ -60,12 +60,12 @@ class MABTrainer:
             context_mask = processed['context_mask'].to(self.device)
 
             # get the probability of the correct label
-            label_prob = self.get_pull_prob(input_ids, attention_mask, input_ids[:, -1])
+            label_log_prob = self.get_pull_log_prob(input_ids, attention_mask, input_ids[:, -1])
 
             logits, value = self.mab_model.get_logits_value(input_ids, attention_mask)
             dist = GumbelKHotDistribution(logits=logits, context_mask=context_mask[:, :-1], k=self.topk, temperature=self.temperature)
 
-            pulls = self.collect_pulls(input_ids, attention_mask, context_mask, label_prob, dist, value, num_pulls=self.num_pulls, gamma=gamma)
+            pulls = self.collect_pulls(input_ids, attention_mask, context_mask, label_log_prob, dist, value, num_pulls=self.num_pulls, gamma=gamma)
 
             for _ in range(self.config['ppo_epochs']):
                 for minibatch in self.ppo_iter(self.minibatch_size, pulls):
@@ -85,7 +85,7 @@ class MABTrainer:
                       input_ids: torch.Tensor, 
                       attention_mask: torch.Tensor,
                       context_mask: torch.Tensor,
-                      label_prob: torch.Tensor,
+                      label_log_prob: torch.Tensor,
                       dist: torch.distributions.Distribution,
                       value: torch.Tensor,
                       num_pulls: int = 3,
@@ -96,7 +96,7 @@ class MABTrainer:
         
         """
         # Initialize lists to gather pull outputs
-        pulls = [self._get_single_pull(input_ids, attention_mask, context_mask, label_prob, dist, value)
+        pulls = [self._get_single_pull(input_ids, attention_mask, context_mask, label_log_prob, dist, value)
                  for _ in range(num_pulls)]
         # Stack the individual pull outputs along a new axis and flatten out the batch dimension
         rewards = torch.cat([p['reward'] for p in pulls], dim=0)
@@ -114,15 +114,15 @@ class MABTrainer:
             'context_masks': batch_rep(context_mask),
             'rewards': rewards,
             'returns': returns,
-            'label_probs': batch_rep(label_prob),
+            'label_log_probs': batch_rep(label_log_prob),
             'old_logits': batch_rep(logits),
         }
 
-    def _get_single_pull(self, input_ids, attention_mask, context_mask, label_prob, dist, value):
+    def _get_single_pull(self, input_ids, attention_mask, context_mask, label_log_prob, dist, value):
         # Sample a pull mask and compute related reward and log probability
         pull_mask = dist.sample()
 
-        reward = self.get_pull_reward_prob(input_ids, attention_mask, context_mask, label_prob, pull_mask)
+        reward = self.get_pull_reward_prob(input_ids, attention_mask, context_mask, label_log_prob, pull_mask)
         return {
             'reward': reward.clone(),
             'pull_mask': pull_mask.clone(),
@@ -310,17 +310,34 @@ class MABTrainer:
         return prob # [batch_size, 1]
     
     @torch.no_grad()
+    def get_pull_log_prob(self, 
+                         input_ids: torch.Tensor, 
+                         attention_mask: torch.Tensor,
+                         label: torch.Tensor):
+        """
+        input_ids: [batch_size, sequence_length]
+        attention_mask: [batch_size, sequence_length]
+        label: [batch_size]
+        """
+        logits = self.get_second_last_token_logits(input_ids, attention_mask) # [batch_size, vocab_size]
+        log_prob = F.log_softmax(logits, -1) # [batch_size, vocab_size]
+        # get the probability of the correct label 
+        log_prob = torch.gather(log_prob, -1, label.unsqueeze(-1)) # [batch_size, 1]
+        return log_prob # [batch_size, 1]
+
+
+    @torch.no_grad()
     def get_pull_reward_prob(self, 
                             input_ids: torch.Tensor, 
                             attention_mask: torch.Tensor,
                             context_mask: torch.Tensor,
-                            label_prob: torch.Tensor,
+                            label_log_prob: torch.Tensor,
                             pull_mask: torch.Tensor):
         """
         input_ids: [batch_size, sequence_length]
         attention_mask: [batch_size, sequence_length]
         context_mask: [batch_size, sequence_length]
-        label_prob: [batch_size, 1]
+        label_log_prob: [batch_size, 1]
         pull_mask: [batch_size, sequence_length-1]
         """
         # We heed the pull mask to be as small as possible 
@@ -333,9 +350,9 @@ class MABTrainer:
         masked_attention_mask = masked_inputs['attention_mask']
 
         #  probability of the correct label
-        prob = self.get_pull_prob(masked_input_ids, masked_attention_mask, label=input_ids[:, -1])# [batch_size, 1]
-
-        reward = label_prob - prob  # the degradation after masking
+        # prob = self.get_pull_prob(masked_input_ids, masked_attention_mask, label=input_ids[:, -1])# [batch_size, 1]
+        log_prob = self.get_pull_log_prob(masked_input_ids, masked_attention_mask, label=input_ids[:, -1])# [batch_size, 1]
+        reward = label_log_prob - log_prob  # the degradation after masking
         return reward
 
 
