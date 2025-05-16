@@ -3,4 +3,4 @@
 Run experiments
 `python llmexp/experiments/*.py`
 
-Use the summarize.py 
+Use the summarize.ipynb to summarize the results
